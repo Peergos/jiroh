@@ -7,7 +7,6 @@ import tech.kwik.core.QuicClientConnection;
 import tech.kwik.core.QuicConnection;
 import tech.kwik.core.QuicStream;
 import tech.kwik.core.impl.QuicConnectionImpl;
-import tech.kwik.core.log.NullLogger;
 import tech.kwik.core.server.ApplicationProtocolConnection;
 import tech.kwik.core.server.ApplicationProtocolConnectionFactory;
 import tech.kwik.core.server.ServerConnection;
@@ -583,10 +582,10 @@ public final class Endpoint implements AutoCloseable {
         return connection;
     }
 
-    /** kwik's own warnings and errors go to stdout with -Djiroh.kwik.log=true. */
+    /** kwik's errors go to java.util.logging; with -Djiroh.kwik.log=true, its warnings and errors go to stdout. */
     static tech.kwik.core.log.Logger kwikLogger() {
         if (!Boolean.getBoolean("jiroh.kwik.log")) {
-            return new NullLogger();
+            return new KwikLog();
         }
         tech.kwik.core.log.SysOutLogger log = new tech.kwik.core.log.SysOutLogger();
         log.logWarning(true);

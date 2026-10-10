@@ -48,7 +48,7 @@ public final class Bench implements ProtocolHandler {
 
     @Override
     public void acceptStream(EndpointId remote, InetSocketAddress remoteAddress, QuicStream stream) {
-        Thread.ofVirtual().start(() -> {
+        (Boolean.getBoolean("bench.platform") ? Thread.ofPlatform() : Thread.ofVirtual()).start(() -> {
             try (OutputStream out = stream.getOutputStream()) {
                 DataInputStream in = new DataInputStream(stream.getInputStream());
                 int mode = in.readUnsignedByte();

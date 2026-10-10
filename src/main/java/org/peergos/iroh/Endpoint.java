@@ -54,8 +54,8 @@ import java.util.logging.Logger;
 public final class Endpoint implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(Endpoint.class.getName());
-    // Multipath (draft-ietf-quic-multipath) is negotiated, as iroh does, but kwik uses only the initial path so far.
-    static final long MAX_PATH_ID = 0;
+    // Multipath (draft-ietf-quic-multipath) is negotiated, as iroh does; by default no paths beyond the first.
+    static final long DEFAULT_MAX_PATH_ID = 0;
     private static final Duration MAX_IDLE_TIMEOUT = Duration.ofSeconds(30);
     // Direct paths get a head start, so the relay is only used when they do not work.
     private static final Duration RELAY_DELAY = Duration.ofMillis(250);
@@ -69,6 +69,7 @@ public final class Endpoint implements AutoCloseable {
     private final X509TrustManager relayTrustManager;
     private final Integer relayQuicPort;
     private final long streamReceiveWindow;
+    private final long maxPathId;
     private final Pkarr pkarr;
     private final Map<URI, RelayTransport> relays = new ConcurrentHashMap<>();
     private record ConnectionKey(EndpointId remote, String alpn) {}
@@ -86,6 +87,7 @@ public final class Endpoint implements AutoCloseable {
         this.relayTrustManager = builder.relayTrustManager;
         this.relayQuicPort = builder.relayQuicPort;
         this.streamReceiveWindow = builder.streamReceiveWindow;
+        this.maxPathId = builder.maxPathId;
         this.pkarr = builder.dht == null? null: new Pkarr(builder.dht);
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "iroh-endpoint-" + secretKey.endpointId().toHex().substring(0, 8));
@@ -110,6 +112,7 @@ public final class Endpoint implements AutoCloseable {
         private Duration timeout = Duration.ofSeconds(10);
         private Integer relayQuicPort = QuicAddressDiscovery.DEFAULT_RELAY_QUIC_PORT;
         private long streamReceiveWindow = DEFAULT_STREAM_RECEIVE_WINDOW;
+        private long maxPathId = DEFAULT_MAX_PATH_ID;
 
         private Builder(SecretKey secretKey) {
             this.secretKey = secretKey;
@@ -165,6 +168,12 @@ public final class Endpoint implements AutoCloseable {
             return this;
         }
 
+        /** The highest multipath path ID the peer may use. */
+        public Builder maxPathId(long maxPathId) {
+            this.maxPathId = maxPathId;
+            return this;
+        }
+
         public Builder timeout(Duration timeout) {
             this.timeout = timeout;
             return this;
@@ -183,7 +192,7 @@ public final class Endpoint implements AutoCloseable {
                         .requireClientRawPublicKey(key -> true)
                         .withConfiguration(ServerConnectionConfig.builder()
                                 .maxIdleTimeoutInSeconds((int) MAX_IDLE_TIMEOUT.toSeconds())
-                                .multipath(MAX_PATH_ID)
+                                .multipath(maxPathId)
                                 .maxOpenPeerInitiatedBidirectionalStreams(100)
                                 .maxOpenPeerInitiatedUnidirectionalStreams(100)
                                 .maxBidirectionalStreamBufferSize(streamReceiveWindow)
@@ -523,7 +532,7 @@ public final class Endpoint implements AutoCloseable {
                 .connectTimeout(timeout)
                 .defaultStreamReceiveBufferSize(streamReceiveWindow)
                 .sharedEndpoint(server.getSharedEndpoint())
-                .multipath(MAX_PATH_ID)
+                .multipath(maxPathId)
                 .build();
         connection.connect();
         return connection;

@@ -6,6 +6,7 @@ import org.peergos.iroh.pkarr.Pkarr;
 import tech.kwik.core.QuicClientConnection;
 import tech.kwik.core.QuicConnection;
 import tech.kwik.core.QuicStream;
+import tech.kwik.core.impl.QuicConnectionImpl;
 import tech.kwik.core.log.NullLogger;
 import tech.kwik.core.server.ApplicationProtocolConnection;
 import tech.kwik.core.server.ApplicationProtocolConnectionFactory;
@@ -54,8 +55,10 @@ import java.util.logging.Logger;
 public final class Endpoint implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(Endpoint.class.getName());
-    // Multipath (draft-ietf-quic-multipath) is negotiated, as iroh does; by default no paths beyond the first.
-    static final long DEFAULT_MAX_PATH_ID = 0;
+    // Multipath (draft-ietf-quic-multipath): path IDs 0..7, the eight concurrent paths iroh allows.
+    static final long DEFAULT_MAX_PATH_ID = 7;
+    // How long to wait for the peer's connection IDs before giving up on opening an extra path.
+    private static final Duration EXTRA_PATH_WAIT = Duration.ofSeconds(5);
     private static final Duration MAX_IDLE_TIMEOUT = Duration.ofSeconds(30);
     // Direct paths get a head start, so the relay is only used when they do not work.
     private static final Duration RELAY_DELAY = Duration.ofMillis(250);
@@ -440,12 +443,17 @@ public final class Endpoint implements AutoCloseable {
             throw new IOException("no addresses for " + remote.id());
         }
         List<IOException> failures = Collections.synchronizedList(new ArrayList<>());
+        List<AddressSupplier> candidates = new ArrayList<>();
         for (InetSocketAddress address : remote.directAddresses()) {
-            attempts.add(attempt(remote.id(), () -> address, alpn, Duration.ZERO, winner, remaining, failures));
+            AddressSupplier candidate = () -> address;
+            candidates.add(candidate);
+            attempts.add(attempt(remote.id(), candidate, alpn, Duration.ZERO, winner, remaining, failures));
         }
         for (URI relayUrl : remote.relayUrls()) {
             Duration delay = remote.directAddresses().isEmpty()? Duration.ZERO: RELAY_DELAY;
-            attempts.add(attempt(remote.id(), () -> relay(relayUrl).addressFor(remote.id()), alpn, delay, winner, remaining, failures));
+            AddressSupplier candidate = () -> relay(relayUrl).addressFor(remote.id());
+            candidates.add(candidate);
+            attempts.add(attempt(remote.id(), candidate, alpn, delay, winner, remaining, failures));
         }
         try {
             QuicClientConnection connection = winner.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
@@ -455,6 +463,9 @@ public final class Endpoint implements AutoCloseable {
                     c.close();
                 }
             }));
+            if (candidates.size() > 1) {
+                Thread.ofVirtual().start(() -> openExtraPaths(connection, candidates));
+            }
             return connection;
         }
         catch (InterruptedException e) {
@@ -469,6 +480,39 @@ public final class Endpoint implements AutoCloseable {
         catch (TimeoutException e) {
             attempts.forEach(a -> a.thenAccept(QuicConnection::close));
             throw new IOException("timed out connecting to " + remote.id());
+        }
+    }
+
+    /**
+     * Opens a multipath path to each candidate address the connection does not already use, as iroh does: a direct
+     * path beside the relay, and the relay as a fallback beside a direct path.
+     */
+    private void openExtraPaths(QuicClientConnection connection, List<AddressSupplier> candidates) {
+        if (!(connection instanceof QuicConnectionImpl impl) || !impl.isMultipathEnabled()) {
+            return;
+        }
+        InetSocketAddress used = connection.getServerAddress();
+        long deadline = System.nanoTime() + EXTRA_PATH_WAIT.toNanos();
+        for (AddressSupplier candidate : candidates) {
+            try {
+                InetSocketAddress address = candidate.get();
+                if (address.equals(used)) {
+                    continue;
+                }
+                while (impl.openPath(address).isEmpty()) {
+                    if (System.nanoTime() > deadline || !connection.isConnected()) {
+                        LOG.fine("no path id available for " + address);
+                        return;
+                    }
+                    Thread.sleep(20);
+                }
+            }
+            catch (IOException e) {
+                LOG.log(Level.FINE, "extra path not opened", e);
+            }
+            catch (InterruptedException e) {
+                return;
+            }
         }
     }
 

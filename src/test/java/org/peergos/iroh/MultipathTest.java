@@ -76,8 +76,9 @@ class MultipathTest {
             Arrays.fill(payload, (byte) 7);
             assertTrue(Arrays.equals(payload, echoBytes(connection, payload)));
             int relayed = relay.forwarded.get() - relayedBefore;
-            // 2 MB each way is about 3000 packets; the direct path has the lower RTT, so it carries nearly all of them.
-            assertTrue(relayed < 300, "relayed " + relayed);
+            // 2 MB each way is about 3000 packets. The direct path has the lower RTT, so it carries them once each side
+            // has an RTT sample for it; the relay carries the acks of the initial path and what went before.
+            assertTrue(relayed < 600, "relayed " + relayed);
             connection.close();
         }
     }
@@ -90,20 +91,16 @@ class MultipathTest {
         FakeRelay.Client relayA = relay.client(keyA.endpointId());
         FakeRelay.Client relayB = relay.client(keyB.endpointId());
         EchoProtocol echo = new EchoProtocol();
-        try (Endpoint a = Endpoint.builder(keyA).bind(LOCALHOST).publish(false).relayQuicPort(null).maxPathId(2)
+        try (Endpoint a = Endpoint.builder(keyA).bind(LOCALHOST).publish(false).relayQuicPort(null)
                      .transport(relayA).build();
-             Endpoint b = Endpoint.builder(keyB).bind(LOCALHOST).publish(false).relayQuicPort(null).maxPathId(2)
+             Endpoint b = Endpoint.builder(keyB).bind(LOCALHOST).publish(false).relayQuicPort(null)
                      .transport(relayB).protocol(EchoProtocol.ALPN, echo).build()) {
             QuicClientConnection connection = a.connect(b.id(), relayA.addressFor(b.id()), EchoProtocol.ALPN);
             assertEquals("hello", EchoProtocol.echo(connection, "hello"));
             QuicConnectionImpl impl = (QuicConnectionImpl) connection;
             awaitConnectionIds(impl.getPathManager(), 1);
-            CompletableFuture<QuicPath> active = new CompletableFuture<>();
-            impl.setPathListener(active::complete);
-            impl.openPath(b.localAddress()).orElseThrow();
-            active.get(5, TimeUnit.SECONDS);
 
-            // Equal RTTs, so the initial (relay) path carries the transfer until the relay goes down halfway.
+            // The transfer starts on the relay path alone; the direct path joins halfway, then the relay goes down.
             byte[] payload = new byte[4_000_000];
             Arrays.fill(payload, (byte) 3);
             int relayedBefore = relay.forwarded.get();
@@ -120,9 +117,38 @@ class MultipathTest {
                 Thread.sleep(1);
             }
             assertTrue(relay.forwarded.get() - relayedBefore >= 500, "relay path carried the transfer");
+            CompletableFuture<QuicPath> active = new CompletableFuture<>();
+            impl.setPathListener(active::complete);
+            impl.openPath(b.localAddress()).orElseThrow();
+            active.get(5, TimeUnit.SECONDS);
             relay.down = true;
             assertTrue(Arrays.equals(payload, echoed.get(30, TimeUnit.SECONDS)));
             assertEquals("still here", EchoProtocol.echo(connection, "still here"));
+            connection.close();
+        }
+    }
+
+    @Test
+    void pathThatIsNotValidatedShouldBeAbandoned() throws Exception {
+        EchoProtocol echo = new EchoProtocol();
+        try (Endpoint a = Endpoint.builder(SecretKey.generate()).bind(LOCALHOST).publish(false).relayQuicPort(null).build();
+             Endpoint b = Endpoint.builder(SecretKey.generate()).bind(LOCALHOST).publish(false).relayQuicPort(null)
+                     .protocol(EchoProtocol.ALPN, echo).build()) {
+            QuicClientConnection connection = a.connect(b.id(), b.localAddress(), EchoProtocol.ALPN);
+            assertEquals("hello", EchoProtocol.echo(connection, "hello"));
+            QuicConnectionImpl impl = (QuicConnectionImpl) connection;
+            awaitConnectionIds(impl.getPathManager(), 1);
+            // TEST-NET-1 never answers.
+            QuicPath dead = impl.openPath(new InetSocketAddress(InetAddress.getByName("192.0.2.1"), 4433)).orElseThrow();
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (!impl.getPaths().isEmpty() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertTrue(impl.getPaths().isEmpty(), impl.getPaths().toString());
+            assertTrue(impl.getPathManager().isAbandoned(dead.getId()));
+            assertEquals("still fine", EchoProtocol.echo(connection, "still fine"));
+            // The next path gets a fresh path id.
+            awaitConnectionIds(impl.getPathManager(), 2);
             connection.close();
         }
     }

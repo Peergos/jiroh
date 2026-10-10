@@ -6,6 +6,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.peergos.iroh.pkarr.MainlineDht;
 import tech.kwik.core.QuicClientConnection;
+import tech.kwik.core.send.QuicPath;
+import tech.kwik.core.impl.QuicConnectionImpl;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -67,6 +69,18 @@ class EndpointLayerTest {
                 .addressLookup(dht());
     }
 
+    private static void assertActiveRelayPath(QuicClientConnection connection) throws InterruptedException {
+        QuicConnectionImpl impl = (QuicConnectionImpl) connection;
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+            if (impl.getPaths().stream().anyMatch(p -> p.getState() == QuicPath.State.ACTIVE && MappedAddresses.isRelayMapped(p.getPeerAddress()))) {
+                return;
+            }
+            Thread.sleep(20);
+        }
+        fail("no active relay path: " + impl.getPaths());
+    }
+
     @Test
     void endpointShouldPublishHomeRelayAndAddress() throws Exception {
         try (Endpoint b = endpoint(SecretKey.generate()).build()) {
@@ -86,6 +100,8 @@ class EndpointLayerTest {
             assertEquals("dialled by id", EchoProtocol.echo(connection, "dialled by id"));
             // The direct path won the race
             assertEquals(a.localAddress(), echo.lastRemoteAddress);
+            // and the relay was added as a second path.
+            assertActiveRelayPath(connection);
             connection.close();
         }
     }
@@ -127,6 +143,8 @@ class EndpointLayerTest {
             QuicClientConnection connection = a.connect(addr, EchoProtocol.ALPN);
             assertEquals("raced", EchoProtocol.echo(connection, "raced"));
             assertFalse(MappedAddresses.isRelayMapped(connection.getServerAddress()), String.valueOf(connection.getServerAddress()));
+            assertActiveRelayPath(connection);
+            assertEquals("with two paths", EchoProtocol.echo(connection, "with two paths"));
             connection.close();
         }
         finally {

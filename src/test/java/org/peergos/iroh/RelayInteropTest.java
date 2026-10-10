@@ -7,6 +7,10 @@ import org.junit.jupiter.api.Test;
 import tech.kwik.core.QuicClientConnection;
 
 import java.io.BufferedReader;
+import java.io.IOException;
+import tech.kwik.core.send.QuicPath;
+import tech.kwik.core.impl.QuicConnectionImpl;
+import java.util.concurrent.CompletableFuture;
 import java.io.InputStreamReader;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -153,6 +157,96 @@ class RelayInteropTest {
             assertEquals(0, client.exitValue(), output);
             assertTrue(output.contains("echo ok: hello from rust iroh #2"), output);
             assertTrue(MappedAddresses.isRelayMapped(echo.lastRemoteAddress), String.valueOf(echo.lastRemoteAddress));
+        }
+    }
+
+    @Test
+    void rustIrohShouldOpenAPathBesideTheRelay() throws Exception {
+        Assumptions.assumeTrue(Files.isExecutable(PROBE.resolve("iroh_client")), "interop-probe not built");
+        SecretKey serverKey = SecretKey.generate();
+        RelayTransport transport = connect(serverKey);
+        EchoProtocol echo = new EchoProtocol();
+        try (Endpoint server = Endpoint.builder(serverKey).bind(LOCALHOST).publish(false).relayQuicPort(null).maxPathId(4)
+                .transport(transport).protocol(EchoProtocol.ALPN, echo).build()) {
+            InetSocketAddress direct = server.localAddress();
+            ProcessBuilder builder = new ProcessBuilder(PROBE.resolve("iroh_client").toString(),
+                    direct.getAddress().getHostAddress() + ":" + direct.getPort(), server.id().toHex(), "3", relay.url.toString())
+                    .redirectErrorStream(true);
+            builder.environment().put("IROH_CLIENT_LINGER_MS", "3000");
+            Process client = builder.start();
+            boolean exited = client.waitFor(30, TimeUnit.SECONDS);
+            String output = new String(client.getInputStream().readAllBytes());
+            System.out.println(output);
+            if (!exited) {
+                client.destroyForcibly();
+                fail("rust client did not finish:\n" + output);
+            }
+            assertEquals(0, client.exitValue(), output);
+            assertTrue(output.contains("echo ok: after linger"), output);
+            // iroh dialled the direct address as path 0 and opened path 1 over the relay, validating it both ways.
+            assertTrue(output.contains("client path event: Opened { id: PathId(1), remote_addr: Relay("), output);
+            String path1 = output.substring(output.indexOf("Closed { id: PathId(1)"));
+            assertTrue(path1.contains("frame_rx: FrameStats {") && path1.substring(path1.indexOf("frame_rx")).contains("PATH_RESPONSE: 1"), output);
+        }
+    }
+
+    @Test
+    void javaShouldOpenADirectPathToRustIroh() throws Exception {
+        Assumptions.assumeTrue(Files.isExecutable(PROBE.resolve("server")), "interop-probe not built");
+        SecretKey serverKey = SecretKey.generate();
+        Process server = new ProcessBuilder(PROBE.resolve("server").toString(), "127.0.0.1:0",
+                HexFormat.of().formatHex(serverKey.toBytes()), relay.url.toString())
+                .redirectErrorStream(true)
+                .start();
+        StringBuffer serverOutput = new StringBuffer();
+        CompletableFuture<Integer> boundPort = new CompletableFuture<>();
+        Thread.ofVirtual().start(() -> {
+            try (BufferedReader out = new BufferedReader(new InputStreamReader(server.getInputStream()))) {
+                for (String line; (line = out.readLine()) != null; ) {
+                    serverOutput.append(line).append('\n');
+                    java.util.regex.Matcher bound = java.util.regex.Pattern.compile("bound: \\[127\\.0\\.0\\.1:(\\d+)").matcher(line);
+                    if (bound.find()) {
+                        boundPort.complete(Integer.parseInt(bound.group(1)));
+                    }
+                }
+            }
+            catch (IOException e) {
+                // process ended
+            }
+        });
+        try {
+            int port = boundPort.get(20, TimeUnit.SECONDS);
+            SecretKey clientKey = SecretKey.generate();
+            RelayTransport transport = connect(clientKey);
+            try (Endpoint client = Endpoint.builder(clientKey).bind(LOCALHOST).publish(false).relayQuicPort(null).maxPathId(4)
+                    .transport(transport).build()) {
+                QuicClientConnection connection = client.connect(serverKey.endpointId(),
+                        transport.addressFor(serverKey.endpointId()), EchoProtocol.ALPN);
+                assertEquals("relayed", EchoProtocol.echo(connection, "relayed"));
+
+                QuicConnectionImpl impl = (QuicConnectionImpl) connection;
+                long deadline = System.currentTimeMillis() + 10_000;
+                while (!impl.getPathManager().hasConnectionIds(1) && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(10);
+                }
+                CompletableFuture<QuicPath> active = new CompletableFuture<>();
+                impl.setPathListener(active::complete);
+                impl.openPath(new InetSocketAddress(InetAddress.getLoopbackAddress(), port)).orElseThrow();
+                assertEquals(1, active.get(10, TimeUnit.SECONDS).getId());
+                for (int i = 0; i < 3; i++) {
+                    assertEquals("direct #" + i, EchoProtocol.echo(connection, "direct #" + i));
+                }
+                deadline = System.currentTimeMillis() + 5_000;
+                while (!serverOutput.toString().contains("Opened { id: PathId(1), remote_addr: Ip(") && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(10);
+                }
+                assertTrue(serverOutput.toString().contains("server path event: Opened { id: PathId(1), remote_addr: Ip("), serverOutput.toString());
+                connection.close();
+            }
+        }
+        finally {
+            server.destroy();
+            server.waitFor(5, TimeUnit.SECONDS);
         }
     }
 

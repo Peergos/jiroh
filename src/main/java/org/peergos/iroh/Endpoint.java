@@ -186,7 +186,7 @@ public final class Endpoint implements AutoCloseable {
             try {
                 server = ServerConnector.builder()
                         .withSocket(socket)
-                        .withLogger(new NullLogger())
+                        .withLogger(kwikLogger())
                         .withRawPublicKey(secretKey.keyPair())
                         // iroh authenticates every client, and accepts any key: authorisation is up to the protocol.
                         .requireClientRawPublicKey(key -> true)
@@ -533,9 +533,20 @@ public final class Endpoint implements AutoCloseable {
                 .defaultStreamReceiveBufferSize(streamReceiveWindow)
                 .sharedEndpoint(server.getSharedEndpoint())
                 .multipath(maxPathId)
+                .logger(kwikLogger())
                 .build();
         connection.connect();
         return connection;
+    }
+
+    /** kwik's own warnings and errors go to stdout with -Djiroh.kwik.log=true. */
+    static tech.kwik.core.log.Logger kwikLogger() {
+        if (!Boolean.getBoolean("jiroh.kwik.log")) {
+            return new NullLogger();
+        }
+        tech.kwik.core.log.SysOutLogger log = new tech.kwik.core.log.SysOutLogger();
+        log.logWarning(true);
+        return log;
     }
 
     /** The endpoint info most recently published, if any. */

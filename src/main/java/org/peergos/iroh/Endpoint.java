@@ -9,6 +9,7 @@ import tech.kwik.core.server.ApplicationProtocolConnectionFactory;
 import tech.kwik.core.server.ServerConnection;
 import tech.kwik.core.server.ServerConnectionConfig;
 import tech.kwik.core.server.ServerConnector;
+import tech.kwik.core.socket.SharedEndpoint;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -73,6 +74,10 @@ public final class Endpoint implements AutoCloseable {
 
     public EndpointId id() {
         return secretKey.endpointId();
+    }
+
+    SharedEndpoint sharedEndpoint() {
+        return server.getSharedEndpoint();
     }
 
     public InetSocketAddress localAddress() {

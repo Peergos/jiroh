@@ -29,6 +29,7 @@ test {
     jvmArgs '--enable-native-access=ALL-UNNAMED'
     systemProperty 'interop.probe.dir', file('../interop-probe/target/release').absolutePath
     systemProperty 'mainline.live', System.getProperty('mainline.live', 'false')
+    systemProperty 'interop.linger', System.getProperty('interop.linger', 'false')
     testLogging {
         events 'failed'
         exceptionFormat 'full'

@@ -129,6 +129,37 @@ class MultipathTest {
     }
 
     @Test
+    void initialPathCanBeAbandonedWhileAnotherRemains() throws Exception {
+        FakeRelay relay = new FakeRelay();
+        SecretKey keyA = SecretKey.generate();
+        SecretKey keyB = SecretKey.generate();
+        FakeRelay.Client relayA = relay.client(keyA.endpointId());
+        FakeRelay.Client relayB = relay.client(keyB.endpointId());
+        EchoProtocol echo = new EchoProtocol();
+        try (Endpoint a = Endpoint.builder(keyA).bind(LOCALHOST).publish(false).relayQuicPort(null).transport(relayA).build();
+             Endpoint b = Endpoint.builder(keyB).bind(LOCALHOST).publish(false).relayQuicPort(null).transport(relayB)
+                     .protocol(EchoProtocol.ALPN, echo).build()) {
+            QuicClientConnection connection = a.connect(b.id(), relayA.addressFor(b.id()), EchoProtocol.ALPN);
+            assertEquals("hello", EchoProtocol.echo(connection, "hello"));
+            QuicConnectionImpl impl = (QuicConnectionImpl) connection;
+            awaitConnectionIds(impl.getPathManager(), 1);
+            CompletableFuture<QuicPath> active = new CompletableFuture<>();
+            impl.setPathListener(active::complete);
+            impl.openPath(b.localAddress()).orElseThrow();
+            active.get(5, TimeUnit.SECONDS);
+
+            impl.abandonPath(0, 0);
+            assertEquals("after abandoning the relay path", EchoProtocol.echo(connection, "after abandoning the relay path"));
+            Thread.sleep(200);
+            int relayed = relay.forwarded.get();
+            byte[] payload = new byte[500_000];
+            assertTrue(Arrays.equals(payload, echoBytes(connection, payload)));
+            assertEquals(relayed, relay.forwarded.get(), "nothing more over the relay");
+            connection.close();
+        }
+    }
+
+    @Test
     void pathThatIsNotValidatedShouldBeAbandoned() throws Exception {
         EchoProtocol echo = new EchoProtocol();
         try (Endpoint a = Endpoint.builder(SecretKey.generate()).bind(LOCALHOST).publish(false).relayQuicPort(null).build();

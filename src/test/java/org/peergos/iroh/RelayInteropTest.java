@@ -236,11 +236,26 @@ class RelayInteropTest {
                 for (int i = 0; i < 3; i++) {
                     assertEquals("direct #" + i, EchoProtocol.echo(connection, "direct #" + i));
                 }
+                if (Boolean.getBoolean("interop.linger")) {
+                    Thread.sleep(15_000);
+                    assertEquals("after linger", EchoProtocol.echo(connection, "after linger"));
+                    System.out.println(serverOutput);
+                }
                 deadline = System.currentTimeMillis() + 5_000;
                 while (!serverOutput.toString().contains("Opened { id: PathId(1), remote_addr: Ip(") && System.currentTimeMillis() < deadline) {
                     Thread.sleep(10);
                 }
                 assertTrue(serverOutput.toString().contains("server path event: Opened { id: PathId(1), remote_addr: Ip("), serverOutput.toString());
+
+                // Leaving the relay path: iroh closes path 0 and carries on over the direct path.
+                impl.abandonPath(0, 0);
+                assertEquals("direct only", EchoProtocol.echo(connection, "direct only"));
+                deadline = System.currentTimeMillis() + 5_000;
+                while (!serverOutput.toString().contains("Closed { id: PathId(0)") && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(10);
+                }
+                assertTrue(serverOutput.toString().contains("server path event: Closed { id: PathId(0)"), serverOutput.toString());
+                assertEquals("still direct", EchoProtocol.echo(connection, "still direct"));
                 connection.close();
             }
         }

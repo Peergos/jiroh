@@ -54,6 +54,8 @@ import java.util.logging.Logger;
 public final class Endpoint implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(Endpoint.class.getName());
+    // Multipath (draft-ietf-quic-multipath) is negotiated, as iroh does, but kwik uses only the initial path so far.
+    static final long MAX_PATH_ID = 0;
     private static final Duration MAX_IDLE_TIMEOUT = Duration.ofSeconds(30);
     // Direct paths get a head start, so the relay is only used when they do not work.
     private static final Duration RELAY_DELAY = Duration.ofMillis(250);
@@ -181,6 +183,7 @@ public final class Endpoint implements AutoCloseable {
                         .requireClientRawPublicKey(key -> true)
                         .withConfiguration(ServerConnectionConfig.builder()
                                 .maxIdleTimeoutInSeconds((int) MAX_IDLE_TIMEOUT.toSeconds())
+                                .multipath(MAX_PATH_ID)
                                 .maxOpenPeerInitiatedBidirectionalStreams(100)
                                 .maxOpenPeerInitiatedUnidirectionalStreams(100)
                                 .maxBidirectionalStreamBufferSize(streamReceiveWindow)
@@ -520,6 +523,7 @@ public final class Endpoint implements AutoCloseable {
                 .connectTimeout(timeout)
                 .defaultStreamReceiveBufferSize(streamReceiveWindow)
                 .sharedEndpoint(server.getSharedEndpoint())
+                .multipath(MAX_PATH_ID)
                 .build();
         connection.connect();
         return connection;

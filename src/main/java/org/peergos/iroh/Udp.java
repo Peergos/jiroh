@@ -5,6 +5,7 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.DatagramChannel;
+import java.util.Arrays;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -12,7 +13,11 @@ import java.util.logging.Logger;
 interface Udp extends AutoCloseable {
 
     interface Sink {
-        void datagram(InetSocketAddress source, byte[] data, int offset, int length);
+        /**
+         * Datagrams received together from one source: segmentSize bytes each, the last possibly shorter. The sink
+         * owns {@code data}.
+         */
+        void received(InetSocketAddress source, byte[] data, int length, int segmentSize);
     }
 
     InetSocketAddress localAddress();
@@ -74,7 +79,8 @@ interface Udp extends AutoCloseable {
                 while (true) {
                     buffer.clear();
                     InetSocketAddress source = (InetSocketAddress) channel.receive(buffer);
-                    sink.datagram(source, buffer.array(), 0, buffer.position());
+                    int length = buffer.position();
+                    sink.received(source, Arrays.copyOf(buffer.array(), length), length, length);
                 }
             }
             catch (ClosedChannelException e) {

@@ -263,7 +263,6 @@ final class LinuxUdp implements Udp {
             MemorySegment control = arena.allocate(CONTROL, 8);
             MemorySegment buffer = arena.allocate(BUFFER, 8);
             MemorySegment state = arena.allocate(CAPTURE);
-            byte[] data = new byte[BUFFER];
             iov.set(ADDRESS, 0, buffer);
             iov.set(JAVA_LONG, 8, BUFFER);
             while (!closed) {
@@ -301,15 +300,9 @@ final class LinuxUdp implements Udp {
                 InetSocketAddress source = readSockaddr(name);
                 int segmentSize = groSegmentSize(control, msg.get(JAVA_LONG, 40));
                 int length = (int) received;
+                byte[] data = new byte[length];
                 MemorySegment.copy(buffer, JAVA_BYTE, 0, data, 0, length);
-                if (segmentSize <= 0 || segmentSize >= length) {
-                    sink.datagram(source, data, 0, length);
-                }
-                else {
-                    for (int offset = 0; offset < length; offset += segmentSize) {
-                        sink.datagram(source, data, offset, Math.min(segmentSize, length - offset));
-                    }
-                }
+                sink.received(source, data, length, segmentSize <= 0 || segmentSize > length ? length : segmentSize);
             }
         }
     }

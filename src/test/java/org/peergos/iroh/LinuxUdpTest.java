@@ -39,7 +39,11 @@ class LinuxUdpTest {
             BlockingQueue<Datagram> received = new LinkedBlockingQueue<>();
             reader = Thread.ofPlatform().daemon().start(() -> {
                 try {
-                    receiver.receiveLoop((source, data, offset, length) -> received.add(new Datagram(source, length, data[offset])));
+                    receiver.receiveLoop((source, data, length, segmentSize) -> {
+                        for (int offset = 0; offset < length; offset += segmentSize) {
+                            received.add(new Datagram(source, Math.min(segmentSize, length - offset), data[offset]));
+                        }
+                    });
                 }
                 catch (Exception e) {
                     // closed

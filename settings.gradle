@@ -1,0 +1,13 @@
+rootProject.name = 'jiroh'
+
+// Local forks: kwik (QUIC) and agent15 (TLS 1.3) with raw public key support.
+includeBuild('../agent15') {
+    dependencySubstitution {
+        substitute module('tech.kwik:agent15') using project(':core')
+    }
+}
+includeBuild('../kwik') {
+    dependencySubstitution {
+        substitute module('tech.kwik:kwik') using project(':kwik')
+    }
+}

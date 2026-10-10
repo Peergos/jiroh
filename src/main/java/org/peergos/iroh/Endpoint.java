@@ -67,6 +67,8 @@ public final class Endpoint implements AutoCloseable {
     private final Integer relayQuicPort;
     private final Pkarr pkarr;
     private final Map<URI, RelayTransport> relays = new ConcurrentHashMap<>();
+    private record ConnectionKey(EndpointId remote, String alpn) {}
+    private final Map<ConnectionKey, CompletableFuture<QuicClientConnection>> connections = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduler;
     private volatile URI homeRelay;
     private volatile InetSocketAddress observedAddress;
@@ -348,6 +350,47 @@ public final class Endpoint implements AutoCloseable {
     }
 
     /**
+     * An open connection to the given endpoint for the given ALPN, reusing an existing one; concurrent callers
+     * share a single dial. Connections are dropped from the cache when they terminate.
+     */
+    public QuicClientConnection connection(EndpointAddr remote, String alpn) throws IOException {
+        return cached(new ConnectionKey(remote.id(), alpn), () -> connect(remote, alpn));
+    }
+
+    /** Like {@link #connection(EndpointAddr, String)}, finding the endpoint's addresses with pkarr. */
+    public QuicClientConnection connection(EndpointId remote, String alpn) throws IOException {
+        return cached(new ConnectionKey(remote, alpn), () -> connect(remote, alpn));
+    }
+
+    private interface Dialer {
+        QuicClientConnection dial() throws IOException;
+    }
+
+    private QuicClientConnection cached(ConnectionKey key, Dialer dialer) throws IOException {
+        CompletableFuture<QuicClientConnection> fresh = new CompletableFuture<>();
+        CompletableFuture<QuicClientConnection> existing = connections.putIfAbsent(key, fresh);
+        if (existing != null) {
+            try {
+                return existing.join();
+            }
+            catch (java.util.concurrent.CompletionException e) {
+                throw e.getCause() instanceof IOException io? io: new IOException(e.getCause());
+            }
+        }
+        try {
+            QuicClientConnection connection = dialer.dial();
+            connection.setConnectionListener(event -> connections.remove(key, fresh));
+            fresh.complete(connection);
+            return connection;
+        }
+        catch (IOException | RuntimeException e) {
+            connections.remove(key, fresh);
+            fresh.completeExceptionally(e);
+            throw e;
+        }
+    }
+
+    /**
      * Connects to the given endpoint, finding its addresses with pkarr on the mainline DHT.
      */
     public QuicClientConnection connect(EndpointId remote, String alpn) throws IOException {
@@ -476,6 +519,7 @@ public final class Endpoint implements AutoCloseable {
     @Override
     public void close() {
         scheduler.shutdownNow();
+        connections.values().forEach(f -> f.thenAccept(QuicConnection::close));
         relays.values().forEach(RelayTransport::close);
         server.close();
         socket.close();

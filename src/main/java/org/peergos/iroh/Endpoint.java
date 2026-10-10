@@ -1,5 +1,8 @@
 package org.peergos.iroh;
 
+import org.peergos.iroh.pkarr.EndpointInfo;
+import org.peergos.iroh.pkarr.MainlineDht;
+import org.peergos.iroh.pkarr.Pkarr;
 import tech.kwik.core.QuicClientConnection;
 import tech.kwik.core.QuicConnection;
 import tech.kwik.core.QuicStream;
@@ -11,32 +14,182 @@ import tech.kwik.core.server.ServerConnectionConfig;
 import tech.kwik.core.server.ServerConnector;
 import tech.kwik.core.socket.SharedEndpoint;
 
+import javax.net.ssl.X509TrustManager;
 import java.io.IOException;
+import java.net.Inet6Address;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.NetworkInterface;
+import java.net.SocketException;
+import java.net.URI;
 import java.security.cert.CertificateException;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
- * A minimal iroh endpoint: QUIC with iroh's TLS (mutually authenticated Ed25519 raw public keys, no SNI) over direct
- * UDP. No relay, no address lookup, no multipath or NAT traversal yet; a Rust iroh v1 endpoint accepts such a
- * single-path peer.
+ * An iroh endpoint: QUIC with iroh's TLS (mutually authenticated Ed25519 raw public keys, no SNI) over one UDP
+ * socket plus relay paths. It picks a home relay, learns its public address with QUIC address discovery, publishes
+ * where it can be reached as a pkarr record on the mainline DHT, and dials other endpoints by id.
  *
- * All connections, incoming and outgoing, share the endpoint's one UDP socket, as hole punching requires.
+ * Without QUIC multipath and NAT traversal, a connection stays on the path it was established on, so connecting
+ * races the direct addresses against the relay and keeps the first handshake that completes.
  */
 public final class Endpoint implements AutoCloseable {
 
+    private static final Logger LOG = Logger.getLogger(Endpoint.class.getName());
     private static final Duration MAX_IDLE_TIMEOUT = Duration.ofSeconds(30);
+    // Direct paths get a head start, so the relay is only used when they do not work.
+    private static final Duration RELAY_DELAY = Duration.ofMillis(250);
+    public static final Duration REPUBLISH_INTERVAL = Duration.ofMinutes(5);
 
     private final SecretKey secretKey;
     private final IrohSocket socket;
     private final ServerConnector server;
+    private final Duration timeout;
+    private final X509TrustManager relayTrustManager;
+    private final Integer relayQuicPort;
+    private final Pkarr pkarr;
+    private final Map<URI, RelayTransport> relays = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService scheduler;
+    private volatile URI homeRelay;
+    private volatile InetSocketAddress observedAddress;
+    private volatile EndpointInfo published;
 
-    private Endpoint(SecretKey secretKey, IrohSocket socket, ServerConnector server) {
-        this.secretKey = secretKey;
+    private Endpoint(Builder builder, IrohSocket socket, ServerConnector server) {
+        this.secretKey = builder.secretKey;
         this.socket = socket;
         this.server = server;
+        this.timeout = builder.timeout;
+        this.relayTrustManager = builder.relayTrustManager;
+        this.relayQuicPort = builder.relayQuicPort;
+        this.pkarr = builder.dht == null? null: new Pkarr(builder.dht);
+        this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "iroh-endpoint-" + secretKey.endpointId().toHex().substring(0, 8));
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
+    public static Builder builder(SecretKey secretKey) {
+        return new Builder(secretKey);
+    }
+
+    public static final class Builder {
+        private final SecretKey secretKey;
+        private InetSocketAddress bindAddress = new InetSocketAddress(0);
+        private final Map<String, ProtocolHandler> protocols = new LinkedHashMap<>();
+        private final List<PacketTransport> transports = new ArrayList<>();
+        private final List<URI> relayUrls = new ArrayList<>();
+        private X509TrustManager relayTrustManager;
+        private MainlineDht dht;
+        private boolean publish = true;
+        private Duration timeout = Duration.ofSeconds(10);
+        private Integer relayQuicPort = QuicAddressDiscovery.DEFAULT_RELAY_QUIC_PORT;
+
+        private Builder(SecretKey secretKey) {
+            this.secretKey = secretKey;
+        }
+
+        public Builder bind(InetSocketAddress bindAddress) {
+            this.bindAddress = bindAddress;
+            return this;
+        }
+
+        public Builder protocol(String alpn, ProtocolHandler handler) {
+            protocols.put(alpn, handler);
+            return this;
+        }
+
+        public Builder transport(PacketTransport transport) {
+            transports.add(transport);
+            return this;
+        }
+
+        /** Candidate home relays; the first that accepts the connection becomes the home relay. */
+        public Builder relays(List<URI> relayUrls) {
+            this.relayUrls.addAll(relayUrls);
+            return this;
+        }
+
+        /** Trust manager for the relays' TLS certificates, when not the default trust store. */
+        public Builder relayTrustManager(X509TrustManager trustManager) {
+            this.relayTrustManager = trustManager;
+            return this;
+        }
+
+        /** Mainline DHT client for pkarr: resolving other endpoints, and publishing this one unless disabled. */
+        public Builder addressLookup(MainlineDht dht) {
+            this.dht = dht;
+            return this;
+        }
+
+        /** The home relay's QUIC address discovery port; null to not discover the public address. */
+        public Builder relayQuicPort(Integer port) {
+            this.relayQuicPort = port;
+            return this;
+        }
+
+        public Builder publish(boolean publish) {
+            this.publish = publish;
+            return this;
+        }
+
+        public Builder timeout(Duration timeout) {
+            this.timeout = timeout;
+            return this;
+        }
+
+        public Endpoint build() throws IOException {
+            IrohSocket socket = new IrohSocket(bindAddress);
+            transports.forEach(socket::addTransport);
+            ServerConnector server;
+            try {
+                server = ServerConnector.builder()
+                        .withSocket(socket)
+                        .withLogger(new NullLogger())
+                        .withRawPublicKey(secretKey.keyPair())
+                        // iroh authenticates every client, and accepts any key: authorisation is up to the protocol.
+                        .requireClientRawPublicKey(key -> true)
+                        .withConfiguration(ServerConnectionConfig.builder()
+                                .maxIdleTimeoutInSeconds((int) MAX_IDLE_TIMEOUT.toSeconds())
+                                .maxOpenPeerInitiatedBidirectionalStreams(100)
+                                .maxOpenPeerInitiatedUnidirectionalStreams(100)
+                                .build())
+                        .build();
+            }
+            catch (CertificateException e) {
+                socket.close();
+                throw new IllegalStateException(e);
+            }
+            protocols.forEach((alpn, handler) -> server.registerApplicationProtocol(alpn, new Factory(handler)));
+            server.start();
+            Endpoint endpoint = new Endpoint(this, socket, server);
+            try {
+                endpoint.start(relayUrls, publish);
+            }
+            catch (RuntimeException e) {
+                endpoint.close();
+                throw e;
+            }
+            return endpoint;
+        }
     }
 
     public static Endpoint bind(SecretKey secretKey, InetSocketAddress bindAddress, Map<String, ProtocolHandler> protocols)
@@ -46,50 +199,260 @@ public final class Endpoint implements AutoCloseable {
 
     public static Endpoint bind(SecretKey secretKey, InetSocketAddress bindAddress, Map<String, ProtocolHandler> protocols,
                                 List<PacketTransport> transports) throws IOException {
-        IrohSocket socket = new IrohSocket(bindAddress);
-        transports.forEach(socket::addTransport);
-        ServerConnector server;
+        Builder builder = builder(secretKey).bind(bindAddress);
+        protocols.forEach(builder::protocol);
+        transports.forEach(builder::transport);
+        return builder.build();
+    }
+
+    private void start(List<URI> relayUrls, boolean publish) {
+        if (!relayUrls.isEmpty()) {
+            homeRelay = connectHomeRelay(relayUrls);
+            if (homeRelay != null && relayQuicPort != null) {
+                observedAddress = discoverAddress(homeRelay).orElse(null);
+            }
+        }
+        if (pkarr != null && publish) {
+            publishNow();
+            scheduler.scheduleWithFixedDelay(this::publishNow, REPUBLISH_INTERVAL.toMillis(), REPUBLISH_INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** Connects to all candidate relays at once and keeps the first to authenticate, as a latency estimate. */
+    private URI connectHomeRelay(List<URI> relayUrls) {
+        CompletableFuture<URI> first = new CompletableFuture<>();
+        AtomicInteger failures = new AtomicInteger();
+        for (URI url : relayUrls) {
+            Thread.ofVirtual().start(() -> {
+                try {
+                    relay(url);
+                    first.complete(url);
+                }
+                catch (IOException e) {
+                    LOG.log(Level.INFO, "relay " + url + " unavailable", e);
+                    if (failures.incrementAndGet() == relayUrls.size()) {
+                        first.complete(null);
+                    }
+                }
+            });
+        }
         try {
-            server = ServerConnector.builder()
-                    .withSocket(socket)
-                    .withLogger(new NullLogger())
-                    .withRawPublicKey(secretKey.keyPair())
-                    // iroh authenticates every client, and accepts any key: authorisation is up to the protocol.
-                    .requireClientRawPublicKey(key -> true)
-                    .withConfiguration(ServerConnectionConfig.builder()
-                            .maxIdleTimeoutInSeconds((int) MAX_IDLE_TIMEOUT.toSeconds())
-                            .maxOpenPeerInitiatedBidirectionalStreams(100)
-                            .maxOpenPeerInitiatedUnidirectionalStreams(100)
-                            .build())
-                    .build();
+            return first.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
         }
-        catch (CertificateException e) {
-            socket.close();
-            throw new IllegalStateException(e);
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
         }
-        protocols.forEach((alpn, handler) -> server.registerApplicationProtocol(alpn, new Factory(handler)));
-        server.start();
-        return new Endpoint(secretKey, socket, server);
+        catch (ExecutionException | TimeoutException e) {
+            return null;
+        }
+    }
+
+    /** The relay transport for the given relay, connecting to it when needed. */
+    private RelayTransport relay(URI url) throws IOException {
+        RelayTransport existing = relays.get(url);
+        if (existing != null) {
+            return existing;
+        }
+        synchronized (relays) {
+            existing = relays.get(url);
+            if (existing != null) {
+                return existing;
+            }
+            RelayTransport transport = RelayTransport.connect(url, secretKey, timeout, relayTrustManager);
+            socket.addTransport(transport);
+            relays.put(url, transport);
+            return transport;
+        }
+    }
+
+    private Optional<InetSocketAddress> discoverAddress(URI relay) {
+        try {
+            InetAddress host = InetAddress.getByName(relay.getHost());
+            InetSocketAddress qad = new InetSocketAddress(host, relayQuicPort);
+            return Optional.of(QuicAddressDiscovery.observe(this, qad, relayTrustManager, Duration.ofSeconds(2)));
+        }
+        catch (IOException e) {
+            LOG.fine("no QUIC address discovery from " + relay + ": " + e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    private void publishNow() {
+        try {
+            EndpointAddr addr = addr();
+            EndpointInfo info = new EndpointInfo(addr.id(), addr.relayUrls(), addr.directAddresses());
+            int stored = pkarr.publish(secretKey, info, timeout);
+            published = info;
+            LOG.fine("published " + info + " on " + stored + " DHT nodes");
+        }
+        catch (RuntimeException e) {
+            LOG.log(Level.WARNING, "publishing endpoint info failed", e);
+        }
     }
 
     public EndpointId id() {
         return secretKey.endpointId();
     }
 
-    SharedEndpoint sharedEndpoint() {
-        return server.getSharedEndpoint();
-    }
-
     public InetSocketAddress localAddress() {
         return (InetSocketAddress) socket.getLocalSocketAddress();
     }
 
+    public Optional<URI> homeRelay() {
+        return Optional.ofNullable(homeRelay);
+    }
+
+    /** This endpoint's address as observed by its home relay (QUIC address discovery), if known. */
+    public Optional<InetSocketAddress> observedAddress() {
+        return Optional.ofNullable(observedAddress);
+    }
+
+    /** This endpoint's own address: its home relay, the publicly observed address and its local addresses. */
+    public EndpointAddr addr() {
+        Set<InetSocketAddress> direct = new LinkedHashSet<>();
+        if (observedAddress != null) {
+            direct.add(observedAddress);
+        }
+        direct.addAll(localAddresses());
+        return new EndpointAddr(id(), homeRelay == null? List.of(): List.of(homeRelay), new ArrayList<>(direct));
+    }
+
+    private List<InetSocketAddress> localAddresses() {
+        InetSocketAddress bound = localAddress();
+        if (!bound.getAddress().isAnyLocalAddress()) {
+            return List.of(bound);
+        }
+        List<InetSocketAddress> addresses = new ArrayList<>();
+        try {
+            for (NetworkInterface nif : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                if (!nif.isUp() || nif.isLoopback() || nif.isVirtual()) {
+                    continue;
+                }
+                for (InetAddress address : Collections.list(nif.getInetAddresses())) {
+                    if (address instanceof Inet6Address v6 && (v6.isLinkLocalAddress() || v6.getScopeId() != 0)) {
+                        continue;
+                    }
+                    addresses.add(new InetSocketAddress(address, bound.getPort()));
+                }
+            }
+        }
+        catch (SocketException e) {
+            LOG.fine("cannot list network interfaces: " + e.getMessage());
+        }
+        return addresses;
+    }
+
+    SharedEndpoint sharedEndpoint() {
+        return server.getSharedEndpoint();
+    }
+
+    /**
+     * Connects to the given endpoint, finding its addresses with pkarr on the mainline DHT.
+     */
+    public QuicClientConnection connect(EndpointId remote, String alpn) throws IOException {
+        if (pkarr == null) {
+            throw new IOException("no address lookup configured");
+        }
+        EndpointInfo info = pkarr.resolve(remote, timeout)
+                .orElseThrow(() -> new IOException("no address found for " + remote));
+        return connect(new EndpointAddr(remote, info.relayUrls(), info.directAddresses()), alpn);
+    }
+
+    /**
+     * Connects to the given endpoint over the first of its paths to complete a handshake: each direct address is
+     * tried at once, its relays shortly after. The handshake fails unless the remote proves it holds the key of
+     * {@code remote.id()}.
+     */
+    public QuicClientConnection connect(EndpointAddr remote, String alpn) throws IOException {
+        List<CompletableFuture<QuicClientConnection>> attempts = new ArrayList<>();
+        CompletableFuture<QuicClientConnection> winner = new CompletableFuture<>();
+        AtomicInteger remaining = new AtomicInteger(remote.directAddresses().size() + remote.relayUrls().size());
+        if (remaining.get() == 0) {
+            throw new IOException("no addresses for " + remote.id());
+        }
+        List<IOException> failures = Collections.synchronizedList(new ArrayList<>());
+        for (InetSocketAddress address : remote.directAddresses()) {
+            attempts.add(attempt(remote.id(), () -> address, alpn, Duration.ZERO, winner, remaining, failures));
+        }
+        for (URI relayUrl : remote.relayUrls()) {
+            Duration delay = remote.directAddresses().isEmpty()? Duration.ZERO: RELAY_DELAY;
+            attempts.add(attempt(remote.id(), () -> relay(relayUrl).addressFor(remote.id()), alpn, delay, winner, remaining, failures));
+        }
+        try {
+            QuicClientConnection connection = winner.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+            // Close the handshakes that lost the race.
+            attempts.forEach(a -> a.thenAccept(c -> {
+                if (c != connection) {
+                    c.close();
+                }
+            }));
+            return connection;
+        }
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException(e);
+        }
+        catch (ExecutionException e) {
+            IOException failure = new IOException("could not connect to " + remote.id(), e.getCause());
+            failures.forEach(failure::addSuppressed);
+            throw failure;
+        }
+        catch (TimeoutException e) {
+            attempts.forEach(a -> a.thenAccept(QuicConnection::close));
+            throw new IOException("timed out connecting to " + remote.id());
+        }
+    }
+
+    private interface AddressSupplier {
+        InetSocketAddress get() throws IOException;
+    }
+
+    private CompletableFuture<QuicClientConnection> attempt(EndpointId remote, AddressSupplier address, String alpn, Duration delay,
+                                                            CompletableFuture<QuicClientConnection> winner, AtomicInteger remaining,
+                                                            List<IOException> failures) {
+        CompletableFuture<QuicClientConnection> result = new CompletableFuture<>();
+        Thread.ofVirtual().start(() -> {
+            try {
+                if (!delay.isZero()) {
+                    Thread.sleep(delay.toMillis());
+                }
+                if (winner.isDone()) {
+                    result.cancel(false);
+                    return;
+                }
+                QuicClientConnection connection = connectVia(remote, address.get(), alpn);
+                result.complete(connection);
+                if (!winner.complete(connection)) {
+                    connection.close();
+                }
+            }
+            catch (IOException e) {
+                failures.add(e);
+                result.completeExceptionally(e);
+                if (remaining.decrementAndGet() == 0) {
+                    winner.completeExceptionally(e);
+                }
+                return;
+            }
+            catch (InterruptedException e) {
+                result.cancel(false);
+                return;
+            }
+            remaining.decrementAndGet();
+        });
+        return result;
+    }
+
     /**
      * Connects to the given endpoint at a known address: a direct UDP address, or a mapped address of one of the
-     * endpoint's transports. The handshake fails unless the remote proves it
-     * holds the key of {@code remote}.
+     * endpoint's transports.
      */
     public QuicClientConnection connect(EndpointId remote, InetSocketAddress address, String alpn) throws IOException {
+        return connectVia(remote, address, alpn);
+    }
+
+    private QuicClientConnection connectVia(EndpointId remote, InetSocketAddress address, String alpn) throws IOException {
         QuicClientConnection connection = QuicClientConnection.newBuilder()
                 // A literal, so no DNS lookup happens.
                 .host(address.getAddress().getHostAddress())
@@ -98,14 +461,22 @@ public final class Endpoint implements AutoCloseable {
                 .serverRawPublicKey(remote::matches)
                 .clientRawPublicKey(secretKey.keyPair())
                 .maxIdleTimeout(MAX_IDLE_TIMEOUT)
+                .connectTimeout(timeout)
                 .sharedEndpoint(server.getSharedEndpoint())
                 .build();
         connection.connect();
         return connection;
     }
 
+    /** The endpoint info most recently published, if any. */
+    public Optional<EndpointInfo> published() {
+        return Optional.ofNullable(published);
+    }
+
     @Override
     public void close() {
+        scheduler.shutdownNow();
+        relays.values().forEach(RelayTransport::close);
         server.close();
         socket.close();
     }

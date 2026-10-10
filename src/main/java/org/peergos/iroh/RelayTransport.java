@@ -1,5 +1,8 @@
 package org.peergos.iroh;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -9,6 +12,7 @@ import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
+import java.security.KeyManagementException;
 import java.security.NoSuchAlgorithmException;
 import java.security.Signature;
 import java.security.SignatureException;
@@ -74,6 +78,7 @@ public final class RelayTransport implements PacketTransport, AutoCloseable {
     private final URI relayUrl;
     private final SecretKey secretKey;
     private final Duration timeout;
+    private final X509TrustManager trustManager;
     private final Map<EndpointId, InetSocketAddress> addresses = new ConcurrentHashMap<>();
     private final Map<InetSocketAddress, EndpointId> endpoints = new ConcurrentHashMap<>();
     private final ScheduledFuture<?> pinger;
@@ -83,10 +88,11 @@ public final class RelayTransport implements PacketTransport, AutoCloseable {
     private volatile boolean closed;
     private Duration backoff = MIN_BACKOFF;
 
-    private RelayTransport(URI relayUrl, SecretKey secretKey, Duration timeout) {
+    private RelayTransport(URI relayUrl, SecretKey secretKey, Duration timeout, X509TrustManager trustManager) {
         this.relayUrl = relayUrl;
         this.secretKey = secretKey;
         this.timeout = timeout;
+        this.trustManager = trustManager;
         this.pinger = TIMER.scheduleWithFixedDelay(this::ping, PING_INTERVAL.toMillis(), PING_INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
     }
 
@@ -96,7 +102,14 @@ public final class RelayTransport implements PacketTransport, AutoCloseable {
      * @param relayUrl  the relay URL as iroh uses it, e.g. https://relay.example/ (http only for local testing)
      */
     public static RelayTransport connect(URI relayUrl, SecretKey secretKey, Duration timeout) throws IOException {
-        RelayTransport transport = new RelayTransport(relayUrl, secretKey, timeout);
+        return connect(relayUrl, secretKey, timeout, null);
+    }
+
+    /**
+     * @param trustManager  trust manager for the relay's certificate, or null for the default trust store
+     */
+    public static RelayTransport connect(URI relayUrl, SecretKey secretKey, Duration timeout, X509TrustManager trustManager) throws IOException {
+        RelayTransport transport = new RelayTransport(relayUrl, secretKey, timeout, trustManager);
         try {
             transport.current = transport.openConnection();
         }
@@ -139,7 +152,18 @@ public final class RelayTransport implements PacketTransport, AutoCloseable {
     private Connection openConnection() throws IOException {
         Connection connection = new Connection();
         URI wsUri = URI.create(("https".equals(relayUrl.getScheme())? "wss": "ws") + "://" + relayUrl.getRawAuthority() + RELAY_PATH);
-        HttpClient client = HttpClient.newBuilder().connectTimeout(timeout).build();
+        HttpClient.Builder clientBuilder = HttpClient.newBuilder().connectTimeout(timeout);
+        if (trustManager != null) {
+            try {
+                SSLContext context = SSLContext.getInstance("TLS");
+                context.init(null, new TrustManager[]{trustManager}, null);
+                clientBuilder.sslContext(context);
+            }
+            catch (NoSuchAlgorithmException | KeyManagementException e) {
+                throw new IOException(e);
+            }
+        }
+        HttpClient client = clientBuilder.build();
         try {
             WebSocket webSocket = client.newWebSocketBuilder()
                     .subprotocols(PROTOCOLS[0], PROTOCOLS[1])

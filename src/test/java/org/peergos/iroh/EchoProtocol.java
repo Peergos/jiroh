@@ -6,6 +6,7 @@ import tech.kwik.core.QuicStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 
 /** The echo protocol of interop-probe: each bidirectional stream echoes what it receives. */
@@ -14,10 +15,12 @@ final class EchoProtocol implements ProtocolHandler {
     static final String ALPN = "iroh-interop/echo/0";
 
     volatile EndpointId lastRemote;
+    volatile InetSocketAddress lastRemoteAddress;
 
     @Override
-    public void acceptStream(EndpointId remote, QuicStream stream) {
+    public void acceptStream(EndpointId remote, InetSocketAddress remoteAddress, QuicStream stream) {
         lastRemote = remote;
+        lastRemoteAddress = remoteAddress;
         Thread.ofVirtual().start(() -> {
             try (OutputStream out = stream.getOutputStream()) {
                 out.write(stream.getInputStream().readAllBytes());

@@ -6,14 +6,15 @@ import tech.kwik.core.QuicStream;
 import tech.kwik.core.log.NullLogger;
 import tech.kwik.core.server.ApplicationProtocolConnection;
 import tech.kwik.core.server.ApplicationProtocolConnectionFactory;
+import tech.kwik.core.server.ServerConnection;
 import tech.kwik.core.server.ServerConnectionConfig;
 import tech.kwik.core.server.ServerConnector;
 
 import java.io.IOException;
-import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.security.cert.CertificateException;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -21,18 +22,17 @@ import java.util.Map;
  * UDP. No relay, no address lookup, no multipath or NAT traversal yet; a Rust iroh v1 endpoint accepts such a
  * single-path peer.
  *
- * TODO: kwik gives every outgoing connection its own UDP socket; iroh needs all connections on the one listening
- * socket (hole punching requires sending from it) plus relay "paths".
+ * All connections, incoming and outgoing, share the endpoint's one UDP socket, as hole punching requires.
  */
 public final class Endpoint implements AutoCloseable {
 
     private static final Duration MAX_IDLE_TIMEOUT = Duration.ofSeconds(30);
 
     private final SecretKey secretKey;
-    private final DatagramSocket socket;
+    private final IrohSocket socket;
     private final ServerConnector server;
 
-    private Endpoint(SecretKey secretKey, DatagramSocket socket, ServerConnector server) {
+    private Endpoint(SecretKey secretKey, IrohSocket socket, ServerConnector server) {
         this.secretKey = secretKey;
         this.socket = socket;
         this.server = server;
@@ -40,7 +40,13 @@ public final class Endpoint implements AutoCloseable {
 
     public static Endpoint bind(SecretKey secretKey, InetSocketAddress bindAddress, Map<String, ProtocolHandler> protocols)
             throws IOException {
-        DatagramSocket socket = new DatagramSocket(bindAddress);
+        return bind(secretKey, bindAddress, protocols, List.of());
+    }
+
+    public static Endpoint bind(SecretKey secretKey, InetSocketAddress bindAddress, Map<String, ProtocolHandler> protocols,
+                                List<PacketTransport> transports) throws IOException {
+        IrohSocket socket = new IrohSocket(bindAddress);
+        transports.forEach(socket::addTransport);
         ServerConnector server;
         try {
             server = ServerConnector.builder()
@@ -74,17 +80,20 @@ public final class Endpoint implements AutoCloseable {
     }
 
     /**
-     * Connects to the given endpoint at a known direct address. The handshake fails unless the remote proves it
+     * Connects to the given endpoint at a known address: a direct UDP address, or a mapped address of one of the
+     * endpoint's transports. The handshake fails unless the remote proves it
      * holds the key of {@code remote}.
      */
     public QuicClientConnection connect(EndpointId remote, InetSocketAddress address, String alpn) throws IOException {
         QuicClientConnection connection = QuicClientConnection.newBuilder()
+                // A literal, so no DNS lookup happens.
                 .host(address.getAddress().getHostAddress())
                 .port(address.getPort())
                 .applicationProtocol(alpn)
                 .serverRawPublicKey(remote::matches)
                 .clientRawPublicKey(secretKey.keyPair())
                 .maxIdleTimeout(MAX_IDLE_TIMEOUT)
+                .sharedEndpoint(server.getSharedEndpoint())
                 .build();
         connection.connect();
         return connection;
@@ -100,10 +109,11 @@ public final class Endpoint implements AutoCloseable {
         @Override
         public ApplicationProtocolConnection createConnection(String protocol, QuicConnection connection) {
             EndpointId remote = EndpointId.fromPublicKey(connection.getPeerRawPublicKey());
+            InetSocketAddress remoteAddress = ((ServerConnection) connection).getInitialRemoteAddress();
             return new ApplicationProtocolConnection() {
                 @Override
                 public void acceptPeerInitiatedStream(QuicStream stream) {
-                    handler.acceptStream(remote, stream);
+                    handler.acceptStream(remote, remoteAddress, stream);
                 }
             };
         }

@@ -41,7 +41,32 @@ class EndpointTest {
             assertEquals("hello", EchoProtocol.echo(connection, "hello"));
             assertEquals(server.id(), EndpointId.fromPublicKey(connection.getPeerRawPublicKey()));
             assertEquals(clientKey.endpointId(), echo.lastRemote);
+            // The outgoing connection uses the client endpoint's listening socket.
+            assertEquals(client.localAddress().getPort(), echo.lastRemoteAddress.getPort());
+            assertEquals(client.localAddress(), connection.getLocalAddress());
             connection.close();
+        }
+    }
+
+    @Test
+    void endpointsShouldConnectToEachOtherOverTheirListeningSockets() throws Exception {
+        EchoProtocol echoA = new EchoProtocol();
+        EchoProtocol echoB = new EchoProtocol();
+        try (Endpoint a = Endpoint.bind(SecretKey.generate(), LOCALHOST, Map.of(EchoProtocol.ALPN, echoA));
+             Endpoint b = Endpoint.bind(SecretKey.generate(), LOCALHOST, Map.of(EchoProtocol.ALPN, echoB))) {
+            // Both directions at once: each endpoint is client and server on the same socket.
+            QuicClientConnection aToB = a.connect(b.id(), b.localAddress(), EchoProtocol.ALPN);
+            QuicClientConnection bToA = b.connect(a.id(), a.localAddress(), EchoProtocol.ALPN);
+            for (int i = 0; i < 5; i++) {
+                assertEquals("a" + i, EchoProtocol.echo(aToB, "a" + i));
+                assertEquals("b" + i, EchoProtocol.echo(bToA, "b" + i));
+            }
+            assertEquals(a.localAddress().getPort(), echoB.lastRemoteAddress.getPort());
+            assertEquals(b.localAddress().getPort(), echoA.lastRemoteAddress.getPort());
+            assertEquals(a.id(), echoB.lastRemote);
+            assertEquals(b.id(), echoA.lastRemote);
+            aToB.close();
+            bToA.close();
         }
     }
 

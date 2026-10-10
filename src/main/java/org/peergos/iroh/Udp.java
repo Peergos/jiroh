@@ -15,9 +15,9 @@ interface Udp extends AutoCloseable {
     interface Sink {
         /**
          * Datagrams received together from one source: segmentSize bytes each, the last possibly shorter. The sink
-         * owns {@code data}.
+         * owns {@code data}. {@code more} tells whether more were already queued in the socket.
          */
-        void received(InetSocketAddress source, byte[] data, int length, int segmentSize);
+        void received(InetSocketAddress source, byte[] data, int length, int segmentSize, boolean more);
     }
 
     InetSocketAddress localAddress();
@@ -80,7 +80,7 @@ interface Udp extends AutoCloseable {
                     buffer.clear();
                     InetSocketAddress source = (InetSocketAddress) channel.receive(buffer);
                     int length = buffer.position();
-                    sink.received(source, Arrays.copyOf(buffer.array(), length), length, length);
+                    sink.received(source, Arrays.copyOf(buffer.array(), length), length, length, false);
                 }
             }
             catch (ClosedChannelException e) {

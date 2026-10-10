@@ -21,7 +21,7 @@ import java.util.concurrent.LinkedBlockingQueue;
  */
 public final class IrohSocket extends DatagramSocket implements SegmentedDatagramSocket {
 
-    private static final Received CLOSED = new Received(null, null, 0, 0);
+    private static final Received CLOSED = new Received(null, null, 0, 0, false);
 
     private final Udp udp;
     private final InetSocketAddress localAddress;
@@ -32,8 +32,9 @@ public final class IrohSocket extends DatagramSocket implements SegmentedDatagra
     // The batch being handed out by receive(), which only kwik's receiver thread calls.
     private Received current;
     private int currentOffset;
+    private boolean lastBatchHadMore;
 
-    private record Received(InetSocketAddress source, byte[] data, int length, int segmentSize) {}
+    private record Received(InetSocketAddress source, byte[] data, int length, int segmentSize, boolean more) {}
 
     public IrohSocket(InetSocketAddress bindAddress) throws IOException {
         // The superclass socket is never bound or used; every method kwik calls is overridden.
@@ -50,14 +51,14 @@ public final class IrohSocket extends DatagramSocket implements SegmentedDatagra
             if (!closed) {
                 byte[] copy = new byte[length];
                 System.arraycopy(data, offset, copy, 0, length);
-                incoming.add(new Received(source, copy, length, length));
+                incoming.add(new Received(source, copy, length, length, false));
             }
         });
     }
 
     private void readUdp() {
         try {
-            udp.receiveLoop((source, data, length, segmentSize) -> incoming.add(new Received(source, data, length, segmentSize)));
+            udp.receiveLoop((source, data, length, segmentSize, more) -> incoming.add(new Received(source, data, length, segmentSize, more)));
         }
         catch (IOException e) {
             if (!closed) {
@@ -104,6 +105,15 @@ public final class IrohSocket extends DatagramSocket implements SegmentedDatagra
 
     @Override
     public void receive(DatagramPacket packet) throws IOException {
+        DatagramPacket next = receive();
+        int length = Math.min(next.getLength(), packet.getData().length - packet.getOffset());
+        System.arraycopy(next.getData(), next.getOffset(), packet.getData(), packet.getOffset(), length);
+        packet.setLength(length);
+        packet.setSocketAddress(next.getSocketAddress());
+    }
+
+    @Override
+    public DatagramPacket receive() throws IOException {
         if (current == null) {
             Received received;
             try {
@@ -122,19 +132,18 @@ public final class IrohSocket extends DatagramSocket implements SegmentedDatagra
         }
         Received received = current;
         int segment = Math.min(received.segmentSize, received.length - currentOffset);
-        int length = Math.min(segment, packet.getData().length - packet.getOffset());
-        System.arraycopy(received.data, currentOffset, packet.getData(), packet.getOffset(), length);
-        packet.setLength(length);
-        packet.setSocketAddress(received.source);
+        DatagramPacket packet = new DatagramPacket(received.data, currentOffset, segment, received.source);
         currentOffset += segment;
         if (currentOffset >= received.length) {
             current = null;
+            lastBatchHadMore = received.more;
         }
+        return packet;
     }
 
     @Override
     public boolean moreReceived() {
-        return current != null || !incoming.isEmpty();
+        return current != null || lastBatchHadMore || !incoming.isEmpty();
     }
 
     @Override

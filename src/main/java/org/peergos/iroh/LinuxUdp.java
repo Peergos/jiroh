@@ -35,7 +35,7 @@ final class LinuxUdp implements Udp {
     private static final int SOL_SOCKET = 1, SO_SNDBUF = 7, SO_RCVBUF = 8;
     private static final int IPPROTO_IPV6 = 41, IPV6_V6ONLY = 26;
     private static final int SOL_UDP = 17, UDP_SEGMENT = 103, UDP_GRO = 104;
-    private static final int SHUT_RDWR = 2, EINTR = 4, EIO = 5;
+    private static final int SHUT_RDWR = 2, EINTR = 4, EIO = 5, EAGAIN = 11, MSG_DONTWAIT = 0x40;
     private static final int SOCKADDR_IN6 = 28, MSGHDR = 56, IOVEC = 16, CONTROL = 64;
     private static final int MAX_SEGMENTS = 64;
     private static final int BUFFER = 65536;
@@ -265,6 +265,10 @@ final class LinuxUdp implements Udp {
             MemorySegment state = arena.allocate(CAPTURE);
             iov.set(ADDRESS, 0, buffer);
             iov.set(JAVA_LONG, 8, BUFFER);
+            // Each batch is handed over once the next read shows whether more were already queued.
+            InetSocketAddress pendingSource = null;
+            byte[] pending = null;
+            int pendingSegmentSize = 0;
             while (!closed) {
                 msg.fill((byte) 0);
                 msg.set(ADDRESS, 0, name);
@@ -275,7 +279,7 @@ final class LinuxUdp implements Udp {
                 msg.set(JAVA_LONG, 40, CONTROL);
                 long received;
                 try {
-                    received = (long) RECVMSG.invokeExact(state, fd, msg, 0);
+                    received = (long) RECVMSG.invokeExact(state, fd, msg, pending == null ? 0 : MSG_DONTWAIT);
                 }
                 catch (Throwable t) {
                     throw new IllegalStateException(t);
@@ -284,6 +288,11 @@ final class LinuxUdp implements Udp {
                     int errno = (int) ERRNO.get(state, 0L);
                     if (closed) {
                         return;
+                    }
+                    if (errno == EAGAIN && pending != null) {
+                        sink.received(pendingSource, pending, pending.length, pendingSegmentSize, false);
+                        pending = null;
+                        continue;
                     }
                     if (errno == EINTR) {
                         continue;
@@ -302,7 +311,12 @@ final class LinuxUdp implements Udp {
                 int length = (int) received;
                 byte[] data = new byte[length];
                 MemorySegment.copy(buffer, JAVA_BYTE, 0, data, 0, length);
-                sink.received(source, data, length, segmentSize <= 0 || segmentSize > length ? length : segmentSize);
+                if (pending != null) {
+                    sink.received(pendingSource, pending, pending.length, pendingSegmentSize, true);
+                }
+                pendingSource = source;
+                pending = data;
+                pendingSegmentSize = segmentSize <= 0 || segmentSize > length ? length : segmentSize;
             }
         }
     }

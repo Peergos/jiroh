@@ -27,6 +27,7 @@ dependencies {
 test {
     useJUnitPlatform()
     systemProperty 'interop.probe.dir', file('../interop-probe/target/release').absolutePath
+    systemProperty 'mainline.live', System.getProperty('mainline.live', 'false')
     testLogging {
         events 'failed'
         exceptionFormat 'full'

@@ -70,6 +70,40 @@ class RelayInteropTest {
     }
 
     @Test
+    void connectionShouldSurviveRelayRestart() throws Exception {
+        connectionShouldSurviveRelayOutage(0);
+    }
+
+    @Test
+    void connectionShouldSurviveRelayOutageWithFailedReconnects() throws Exception {
+        connectionShouldSurviveRelayOutage(2000);
+    }
+
+    private void connectionShouldSurviveRelayOutage(long downMillis) throws Exception {
+        SecretKey keyA = SecretKey.generate();
+        SecretKey keyB = SecretKey.generate();
+        RelayTransport relayA = connect(keyA);
+        RelayTransport relayB = connect(keyB);
+        EchoProtocol echoB = new EchoProtocol();
+        try (Endpoint a = Endpoint.bind(keyA, LOCALHOST, Map.of(), List.of(relayA));
+             Endpoint b = Endpoint.bind(keyB, LOCALHOST, Map.of(EchoProtocol.ALPN, echoB), List.of(relayB))) {
+            QuicClientConnection connection = a.connect(b.id(), relayA.addressFor(b.id()), EchoProtocol.ALPN);
+            assertEquals("before", EchoProtocol.echo(connection, "before"));
+
+            relay.restart(downMillis);
+            long deadline = System.currentTimeMillis() + 15_000;
+            while (!(relayA.connectionCount() >= 2 && relayA.isConnected() && relayB.connectionCount() >= 2 && relayB.isConnected())) {
+                assertTrue(System.currentTimeMillis() < deadline, "relay transports did not reconnect");
+                Thread.sleep(50);
+            }
+
+            // The same QUIC connection: the mapped addresses are unchanged, so QUIC just sees some lost packets.
+            assertEquals("after", EchoProtocol.echo(connection, "after"));
+            connection.close();
+        }
+    }
+
+    @Test
     void javaShouldConnectToRustIrohViaRelay() throws Exception {
         Assumptions.assumeTrue(Files.isExecutable(PROBE.resolve("server")), "interop-probe not built");
         SecretKey serverKey = SecretKey.generate();

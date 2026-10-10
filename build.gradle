@@ -26,6 +26,7 @@ dependencies {
 
 test {
     useJUnitPlatform()
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
     systemProperty 'interop.probe.dir', file('../interop-probe/target/release').absolutePath
     systemProperty 'mainline.live', System.getProperty('mainline.live', 'false')
     testLogging {
@@ -33,4 +34,8 @@ test {
         exceptionFormat 'full'
         showStandardStreams = true
     }
+}
+
+tasks.register('printTestClasspath') {
+    doLast { println sourceSets.test.runtimeClasspath.asPath }
 }

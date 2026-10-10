@@ -58,6 +58,7 @@ public final class Endpoint implements AutoCloseable {
     // Direct paths get a head start, so the relay is only used when they do not work.
     private static final Duration RELAY_DELAY = Duration.ofMillis(250);
     public static final Duration REPUBLISH_INTERVAL = Duration.ofMinutes(5);
+    public static final long DEFAULT_STREAM_RECEIVE_WINDOW = 2 * 1024 * 1024;
 
     private final SecretKey secretKey;
     private final IrohSocket socket;
@@ -65,6 +66,7 @@ public final class Endpoint implements AutoCloseable {
     private final Duration timeout;
     private final X509TrustManager relayTrustManager;
     private final Integer relayQuicPort;
+    private final long streamReceiveWindow;
     private final Pkarr pkarr;
     private final Map<URI, RelayTransport> relays = new ConcurrentHashMap<>();
     private record ConnectionKey(EndpointId remote, String alpn) {}
@@ -81,6 +83,7 @@ public final class Endpoint implements AutoCloseable {
         this.timeout = builder.timeout;
         this.relayTrustManager = builder.relayTrustManager;
         this.relayQuicPort = builder.relayQuicPort;
+        this.streamReceiveWindow = builder.streamReceiveWindow;
         this.pkarr = builder.dht == null? null: new Pkarr(builder.dht);
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "iroh-endpoint-" + secretKey.endpointId().toHex().substring(0, 8));
@@ -104,6 +107,7 @@ public final class Endpoint implements AutoCloseable {
         private boolean publish = true;
         private Duration timeout = Duration.ofSeconds(10);
         private Integer relayQuicPort = QuicAddressDiscovery.DEFAULT_RELAY_QUIC_PORT;
+        private long streamReceiveWindow = DEFAULT_STREAM_RECEIVE_WINDOW;
 
         private Builder(SecretKey secretKey) {
             this.secretKey = secretKey;
@@ -153,6 +157,12 @@ public final class Endpoint implements AutoCloseable {
             return this;
         }
 
+        /** Flow control credit per stream; the connection gets ten times this. */
+        public Builder streamReceiveWindow(long bytes) {
+            this.streamReceiveWindow = bytes;
+            return this;
+        }
+
         public Builder timeout(Duration timeout) {
             this.timeout = timeout;
             return this;
@@ -173,6 +183,9 @@ public final class Endpoint implements AutoCloseable {
                                 .maxIdleTimeoutInSeconds((int) MAX_IDLE_TIMEOUT.toSeconds())
                                 .maxOpenPeerInitiatedBidirectionalStreams(100)
                                 .maxOpenPeerInitiatedUnidirectionalStreams(100)
+                                .maxBidirectionalStreamBufferSize(streamReceiveWindow)
+                                .maxUnidirectionalStreamBufferSize(streamReceiveWindow)
+                                .maxConnectionBufferSize(10 * streamReceiveWindow)
                                 .build())
                         .build();
             }
@@ -505,6 +518,7 @@ public final class Endpoint implements AutoCloseable {
                 .clientRawPublicKey(secretKey.keyPair())
                 .maxIdleTimeout(MAX_IDLE_TIMEOUT)
                 .connectTimeout(timeout)
+                .defaultStreamReceiveBufferSize(streamReceiveWindow)
                 .sharedEndpoint(server.getSharedEndpoint())
                 .build();
         connection.connect();

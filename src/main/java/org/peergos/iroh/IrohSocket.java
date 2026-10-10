@@ -1,5 +1,7 @@
 package org.peergos.iroh;
 
+import tech.kwik.core.socket.SegmentedDatagramSocket;
+
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -7,9 +9,6 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.SocketException;
-import java.nio.ByteBuffer;
-import java.nio.channels.ClosedChannelException;
-import java.nio.channels.DatagramChannel;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -20,12 +19,11 @@ import java.util.concurrent.LinkedBlockingQueue;
  * a relay) when addressed to that transport's mapped addresses. kwik only uses {@link DatagramSocket}'s send,
  * receive, local address and close, so presenting the paths as one {@code DatagramSocket} needs no QUIC changes.
  */
-public final class IrohSocket extends DatagramSocket {
+public final class IrohSocket extends DatagramSocket implements SegmentedDatagramSocket {
 
-    private static final int MAX_DATAGRAM_SIZE = 65536;
     private static final Received CLOSED = new Received(null, null);
 
-    private final DatagramChannel udp;
+    private final Udp udp;
     private final InetSocketAddress localAddress;
     private final List<PacketTransport> transports = new CopyOnWriteArrayList<>();
     private final BlockingQueue<Received> incoming = new LinkedBlockingQueue<>();
@@ -37,10 +35,10 @@ public final class IrohSocket extends DatagramSocket {
     public IrohSocket(InetSocketAddress bindAddress) throws IOException {
         // The superclass socket is never bound or used; every method kwik calls is overridden.
         super((SocketAddress) null);
-        udp = DatagramChannel.open();
-        udp.bind(bindAddress);
-        localAddress = (InetSocketAddress) udp.getLocalAddress();
-        udpReader = Thread.ofVirtual().name("iroh-udp-" + localAddress.getPort()).start(this::readUdp);
+        udp = Udp.bind(bindAddress);
+        localAddress = udp.localAddress();
+        // A platform thread: the native socket blocks in recvmsg, which would pin a virtual thread's carrier.
+        udpReader = Thread.ofPlatform().daemon().name("iroh-udp-" + localAddress.getPort()).start(this::readUdp);
     }
 
     public void addTransport(PacketTransport transport) {
@@ -55,19 +53,12 @@ public final class IrohSocket extends DatagramSocket {
     }
 
     private void readUdp() {
-        ByteBuffer buffer = ByteBuffer.allocate(MAX_DATAGRAM_SIZE);
         try {
-            while (!closed) {
-                buffer.clear();
-                InetSocketAddress source = (InetSocketAddress) udp.receive(buffer);
-                buffer.flip();
-                byte[] data = new byte[buffer.remaining()];
-                buffer.get(data);
-                incoming.add(new Received(source, data));
-            }
-        }
-        catch (ClosedChannelException e) {
-            // closed
+            udp.receiveLoop((source, data, offset, length) -> {
+                byte[] copy = new byte[length];
+                System.arraycopy(data, offset, copy, 0, length);
+                incoming.add(new Received(source, copy));
+            });
         }
         catch (IOException e) {
             if (!closed) {
@@ -88,7 +79,28 @@ public final class IrohSocket extends DatagramSocket {
                 return;
             }
         }
-        udp.send(ByteBuffer.wrap(packet.getData(), packet.getOffset(), packet.getLength()), destination);
+        udp.send(packet.getData(), packet.getOffset(), packet.getLength(), destination);
+    }
+
+    @Override
+    public int maxSegments() {
+        return udp.maxSegments();
+    }
+
+    @Override
+    public void sendSegmented(byte[] data, int offset, int length, int segmentSize, InetSocketAddress destination) throws IOException {
+        if (closed) {
+            throw new SocketException("Socket is closed");
+        }
+        for (PacketTransport transport : transports) {
+            if (transport.handles(destination)) {
+                for (int end = offset + length; offset < end; offset += segmentSize) {
+                    transport.send(destination, data, offset, Math.min(segmentSize, end - offset));
+                }
+                return;
+            }
+        }
+        udp.sendSegmented(data, offset, length, segmentSize, destination);
     }
 
     @Override
@@ -143,12 +155,7 @@ public final class IrohSocket extends DatagramSocket {
         }
         closed = true;
         transports.forEach(PacketTransport::close);
-        try {
-            udp.close();
-        }
-        catch (IOException e) {
-            // ignore
-        }
+        udp.close();
         incoming.add(CLOSED);
         super.close();
     }

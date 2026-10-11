@@ -6,8 +6,10 @@
 #   hostA 10.0.1.2 -- natA 198.18.0.1 --+-- relay 198.18.0.254
 #   hostB 10.0.2.2 -- natB 198.18.0.2 --+
 #
-# Usage: ./nat-test.sh [java|rust] [java|rust]: the server and the client, jiroh (default) or Rust iroh (the
-# interop-probe binaries). The client knows only the server's relay; the test passes when it gets a direct path.
+# Usage: ./nat-test.sh [java|rust] [java|rust] [portmap]: the server and the client, jiroh (default) or Rust iroh
+# (the interop-probe binaries). The client knows only the server's relay; the test passes when it gets a direct path.
+# With portmap, natA runs a PCP/NAT-PMP server (PortMappingGateway) and maps ports with DNAT rules, while its
+# masquerading uses random ports, so the server is only reachable at its port mapped address.
 set -eu
 cd "$(dirname "$0")"
 RELAY_BIN=${IROH_RELAY_BIN:-../iroh/target/release/iroh-relay}
@@ -17,8 +19,10 @@ if [ "${NAT_TEST_INSIDE:-}" != 1 ]; then
 fi
 JAVA="java --enable-native-access=ALL-UNNAMED ${NAT_TEST_JAVA_OPTS:-} -cp $CP org.peergos.iroh.NatPeer"
 PROBE=../interop-probe/target/release
+JAVA_GATEWAY="java -cp $CP org.peergos.iroh.PortMappingGateway"
 SERVER=${1:-java}
 CLIENT=${2:-java}
+PORTMAP=${3:-}
 DIR=$(mktemp -d)
 trap 'kill $(jobs -p) 2>/dev/null; wait 2>/dev/null; rm -rf $DIR' EXIT
 
@@ -53,16 +57,22 @@ for i in 1 2; do
     ns nat$n tc qdisc add dev wan root netem delay ${NAT_TEST_DELAY_MS:-10}ms
     ns nat$n nft -f - <<NFT
 table ip nat {
-    chain postrouting { type nat hook postrouting priority srcnat; oifname "wan" masquerade; }
+    chain prerouting { type nat hook prerouting priority dstnat; }
+    chain postrouting { type nat hook postrouting priority srcnat; oifname "wan" masquerade $([ -n "$PORTMAP" ] && [ $n = A ] && echo random); }
 }
 table ip filter {
     chain forward { type filter hook forward priority filter; policy drop;
         iifname "lan" accept
         ct state established,related accept
+        ct status dnat accept
     }
 }
 NFT
 done
+# NAT_TEST_NO_GATEWAY=1: the control, without which the portmap test must fail.
+if [ -n "$PORTMAP" ] && [ -z "${NAT_TEST_NO_GATEWAY:-}" ]; then
+    ns natA $JAVA_GATEWAY 10.0.1.1 198.18.0.1 > $DIR/gateway.log 2>&1 &
+fi
 
 # A CA (cert.pem, which the endpoints trust) and the relay's certificate: rustls rejects a CA as the end entity.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout $DIR/ca-key.pem -out $DIR/cert.pem \
@@ -108,10 +118,16 @@ if [ $CLIENT = rust ]; then
     grep -q "Opened { id: PathId([0-9]*), remote_addr: Ip(198.18.0.1:" $DIR/client.log
     STATUS=$?
 else
-    ns hostB $JAVA client $RELAY $DIR/cert.pem 7842 $ID 2>&1 | sed 's/^/client: /'
+    ns hostB $JAVA client $RELAY $DIR/cert.pem 7842 $ID 2>&1 | tee $DIR/client-java.log | sed 's/^/client: /'
     STATUS=${PIPESTATUS[0]}
 fi
 sed 's/^/server: /' $DIR/server.log | grep -v "endpoint id\|observed\|direct addresses" | sed 's/last_stats: .*/.../'
+if [ -n "$PORTMAP" ]; then
+    sed 's/^/gateway: /' $DIR/gateway.log
+    # The direct path must go to the port mapped address.
+    MAPPED=$(grep -o "198.18.0.1:[0-9]* ->" $DIR/gateway.log | head -1 | cut -d' ' -f1)
+    [ -n "$MAPPED" ] && grep -q "$MAPPED" $DIR/client.log $DIR/client-java.log 2>/dev/null || STATUS=1
+fi
 if [ -n "${NAT_TEST_CAPTURE:-}" ]; then
     sleep 0.5
     sed 's/^/capture: /' $DIR/capture.log | head -${NAT_TEST_CAPTURE}

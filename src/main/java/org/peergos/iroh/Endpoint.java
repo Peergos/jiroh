@@ -3,6 +3,7 @@ package org.peergos.iroh;
 import org.peergos.iroh.pkarr.EndpointInfo;
 import org.peergos.iroh.pkarr.MainlineDht;
 import org.peergos.iroh.pkarr.Pkarr;
+import org.peergos.iroh.portmap.PortMapper;
 import tech.kwik.core.QuicClientConnection;
 import tech.kwik.core.QuicConnection;
 import tech.kwik.core.QuicStream;
@@ -62,6 +63,9 @@ public final class Endpoint implements AutoCloseable {
     // Direct paths get a head start, so the relay is only used when they do not work.
     private static final Duration RELAY_DELAY = Duration.ofMillis(250);
     public static final Duration REPUBLISH_INTERVAL = Duration.ofMinutes(5);
+    // As iroh's periodic re-STUN: the public address and port mapping are refreshed every 20 to 26 seconds.
+    private static final Duration REDISCOVER_MIN = Duration.ofSeconds(20);
+    private static final Duration REDISCOVER_MAX = Duration.ofSeconds(26);
     public static final long DEFAULT_STREAM_RECEIVE_WINDOW = 2 * 1024 * 1024;
 
     private final SecretKey secretKey;
@@ -74,12 +78,16 @@ public final class Endpoint implements AutoCloseable {
     private final long maxPathId;
     private final Pkarr pkarr;
     private final NatTraversal natTraversal;
+    private final PortMapper portMapper;
+    private final boolean publish;
+    private volatile InetSocketAddress portMapped;
     private final Map<URI, RelayTransport> relays = new ConcurrentHashMap<>();
     private record ConnectionKey(EndpointId remote, String alpn) {}
     private final Map<ConnectionKey, CompletableFuture<QuicClientConnection>> connections = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduler;
     private volatile URI homeRelay;
     private volatile InetSocketAddress observedAddress;
+    private final java.util.Random random = new java.util.Random();
     private volatile EndpointInfo published;
 
     private Endpoint(Builder builder, IrohSocket socket, ServerConnector server) {
@@ -98,6 +106,15 @@ public final class Endpoint implements AutoCloseable {
             return t;
         });
         this.natTraversal = builder.natTraversal? new NatTraversal(() -> addr().directAddresses(), scheduler): null;
+        this.publish = builder.publish;
+        InetSocketAddress bound = (InetSocketAddress) socket.getLocalSocketAddress();
+        // Not when bound to loopback (e.g. in tests): only an address the gateway can reach is worth mapping.
+        this.portMapper = builder.portMapping && !bound.getAddress().isLoopbackAddress()
+                ? new PortMapper(bound.getPort(), external -> {
+                    portMapped = external.orElse(null);
+                    scheduler.execute(this::directAddressesChanged);
+                })
+                : null;
     }
 
     public static Builder builder(SecretKey secretKey) {
@@ -118,6 +135,7 @@ public final class Endpoint implements AutoCloseable {
         private long streamReceiveWindow = DEFAULT_STREAM_RECEIVE_WINDOW;
         private long maxPathId = DEFAULT_MAX_PATH_ID;
         private boolean natTraversal = true;
+        private boolean portMapping = true;
 
         private Builder(SecretKey secretKey) {
             this.secretKey = secretKey;
@@ -176,6 +194,12 @@ public final class Endpoint implements AutoCloseable {
         /** The highest multipath path ID the peer may use. */
         public Builder maxPathId(long maxPathId) {
             this.maxPathId = maxPathId;
+            return this;
+        }
+
+        /** Whether to map the UDP port on the gateway with PCP, NAT-PMP or UPnP (on by default). */
+        public Builder portMapping(boolean portMapping) {
+            this.portMapping = portMapping;
             return this;
         }
 
@@ -247,6 +271,9 @@ public final class Endpoint implements AutoCloseable {
     }
 
     private void start(List<URI> relayUrls, boolean publish) {
+        if (portMapper != null) {
+            portMapper.procure();
+        }
         if (!relayUrls.isEmpty()) {
             homeRelay = connectHomeRelay(relayUrls);
             if (homeRelay != null && relayQuicPort != null) {
@@ -257,6 +284,38 @@ public final class Endpoint implements AutoCloseable {
         if (pkarr != null && publish) {
             publishNow();
             scheduler.scheduleWithFixedDelay(this::publishNow, REPUBLISH_INTERVAL.toMillis(), REPUBLISH_INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
+        }
+        if (portMapper != null || (homeRelay != null && relayQuicPort != null)) {
+            scheduleRediscovery();
+        }
+    }
+
+    private void scheduleRediscovery() {
+        long delay = REDISCOVER_MIN.toMillis() + random.nextLong(REDISCOVER_MAX.toMillis() - REDISCOVER_MIN.toMillis() + 1);
+        try {
+            scheduler.schedule(this::rediscover, delay, TimeUnit.MILLISECONDS);
+        }
+        catch (java.util.concurrent.RejectedExecutionException closed) {
+        }
+    }
+
+    /** Refreshes the public address and the port mapping; the endpoint's addresses are updated when they change. */
+    private void rediscover() {
+        try {
+            if (portMapper != null) {
+                portMapper.procure();
+            }
+            if (homeRelay != null && relayQuicPort != null) {
+                InetSocketAddress observed = discoverAddress(homeRelay).orElse(observedAddress);
+                if (!java.util.Objects.equals(observed, observedAddress)) {
+                    LOG.info("public address changed from " + observedAddress + " to " + observed);
+                    observedAddress = observed;
+                    directAddressesChanged();
+                }
+            }
+        }
+        finally {
+            scheduleRediscovery();
         }
     }
 
@@ -312,6 +371,10 @@ public final class Endpoint implements AutoCloseable {
         if (natTraversal != null) {
             natTraversal.candidatesChanged();
         }
+        EndpointInfo current = published;
+        if (pkarr != null && publish && current != null && !current.directAddresses().equals(addr().directAddresses())) {
+            publishNow();
+        }
     }
 
     private Optional<InetSocketAddress> discoverAddress(URI relay) {
@@ -356,9 +419,20 @@ public final class Endpoint implements AutoCloseable {
         return Optional.ofNullable(observedAddress);
     }
 
-    /** This endpoint's own address: its home relay, the publicly observed address and its local addresses. */
+    /** The address the gateway maps to this endpoint's port (PCP, NAT-PMP or UPnP), if any. */
+    public Optional<InetSocketAddress> portMappedAddress() {
+        return Optional.ofNullable(portMapped);
+    }
+
+    /**
+     * This endpoint's own address: its home relay, the port mapped address, the publicly observed address and its local
+     * addresses.
+     */
     public EndpointAddr addr() {
         Set<InetSocketAddress> direct = new LinkedHashSet<>();
+        if (portMapped != null) {
+            direct.add(portMapped);
+        }
         if (observedAddress != null) {
             direct.add(observedAddress);
         }
@@ -635,6 +709,9 @@ public final class Endpoint implements AutoCloseable {
     @Override
     public void close() {
         scheduler.shutdownNow();
+        if (portMapper != null) {
+            portMapper.close();
+        }
         connections.values().forEach(f -> f.thenAccept(QuicConnection::close));
         relays.values().forEach(RelayTransport::close);
         server.close();

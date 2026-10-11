@@ -7,8 +7,8 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * kwik's log, into java.util.logging: errors that carry an exception (such as a connection aborted by an internal
- * error) at WARNING, other kwik errors at FINE. kwik's other categories stay off.
+ * kwik's log, into java.util.logging: errors (internal errors, closes with an error, idle timeouts) at WARNING,
+ * except the sender's busy wait notice, which is FINE. kwik's other categories stay off.
  */
 final class KwikLog extends BaseLogger {
 
@@ -16,7 +16,7 @@ final class KwikLog extends BaseLogger {
 
     @Override
     protected void log(String message) {
-        LOG.fine(message);
+        LOG.log(message.contains("busy wait")? Level.FINE: Level.WARNING, message);
     }
 
     @Override

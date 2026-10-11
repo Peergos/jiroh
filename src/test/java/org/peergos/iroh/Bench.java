@@ -27,7 +27,38 @@ public final class Bench implements ProtocolHandler {
     static final String ALPN = "iroh-bench/0";
     private static final int CHUNK = 64 * 1024;
 
+    // Progress watchdog: prints the connection's state when a transfer makes no progress for a while.
+    private static final java.util.concurrent.atomic.AtomicLong progress = new java.util.concurrent.atomic.AtomicLong();
+    private static volatile tech.kwik.core.impl.QuicConnectionImpl watched;
+
+    private static void startWatchdog() {
+        Thread.ofPlatform().daemon().start(() -> {
+            long last = -1;
+            int still = 0;
+            while (true) {
+                try {
+                    Thread.sleep(1000);
+                }
+                catch (InterruptedException e) {
+                    return;
+                }
+                long now = progress.get();
+                tech.kwik.core.impl.QuicConnectionImpl connection = watched;
+                if (now == last && connection != null) {
+                    if (++still == 4) {
+                        System.err.println("STALL at " + now + ": " + connection.debugState());
+                    }
+                }
+                else {
+                    still = 0;
+                }
+                last = now;
+            }
+        });
+    }
+
     public static void main(String[] args) throws Exception {
+        startWatchdog();
         if (args[0].equals("server")) {
             int port = args.length > 1 ? Integer.parseInt(args[1]) : 0;
             Endpoint endpoint = endpoint(port).protocol(ALPN, new Bench()).build();
@@ -48,6 +79,9 @@ public final class Bench implements ProtocolHandler {
 
     @Override
     public void acceptStream(EndpointId remote, InetSocketAddress remoteAddress, QuicStream stream) {
+        if (stream instanceof tech.kwik.core.stream.QuicStreamImpl impl) {
+            watched = impl.getConnectionImpl();
+        }
         (Boolean.getBoolean("bench.platform") ? Thread.ofPlatform() : Thread.ofVirtual()).start(() -> {
             try (OutputStream out = stream.getOutputStream()) {
                 DataInputStream in = new DataInputStream(stream.getInputStream());
@@ -100,6 +134,7 @@ public final class Bench implements ProtocolHandler {
 
     private static long transfer(QuicClientConnection connection, boolean upload, long size) throws IOException {
         QuicStream stream = connection.createStream(true);
+        watched = (tech.kwik.core.impl.QuicConnectionImpl) connection;
         DataOutputStream out = new DataOutputStream(stream.getOutputStream());
         out.writeByte(upload ? 'u' : 'd');
         out.writeLong(size);
@@ -125,6 +160,7 @@ public final class Bench implements ProtocolHandler {
         long total = 0;
         for (int n; (n = in.read(buf)) > 0; ) {
             total += n;
+            progress.addAndGet(n);
         }
         return total;
     }
@@ -136,6 +172,7 @@ public final class Bench implements ProtocolHandler {
             int n = (int) Math.min(left, CHUNK);
             out.write(buf, 0, n);
             left -= n;
+            progress.addAndGet(n);
         }
     }
 }

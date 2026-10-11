@@ -89,6 +89,9 @@ public final class Bench implements ProtocolHandler {
                 long size = in.readLong();
                 if (mode == 'u') {
                     new DataOutputStream(out).writeLong(drain(in));
+                    if (Boolean.getBoolean("bench.stats") && watched != null) {
+                        System.out.println("server " + watched.getStats());
+                    }
                 }
                 else {
                     writeBytes(out, size);

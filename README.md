@@ -26,10 +26,13 @@ stream, 512 MiB, best of 5 runs, MiB/s (Ryzen 9 7940HS, Linux 6.8, Java 25, iroh
 
 | client → server | upload | download |
 |---|---|---|
-| Rust iroh → Rust iroh | 701 | 686 |
-| jiroh → Rust iroh | 739 | 571 |
-| Rust iroh → jiroh | 510 | 678 |
-| jiroh → jiroh | 668 | 639 |
+| Rust iroh → Rust iroh | 639 | 639 |
+| jiroh → Rust iroh | 814 | 443 |
+| Rust iroh → jiroh | 482 | 695 |
+| jiroh → jiroh | 759 | 665 |
 
-jiroh sends at or above Rust iroh's rate. Receiving from Rust iroh is slower: about what a plain (non-iroh) noq
-client gets, while iroh's own receiver gets more from its socket layer. Numbers vary by about 5% between runs.
+jiroh sends faster than Rust iroh, and jiroh to jiroh beats Rust iroh to Rust iroh: interleaving the two (same
+machine load), jiroh↔jiroh got 695–767 up and 641–697 down against 642–661 and 586–649. Receiving from Rust iroh
+is slower, 73–87% of Rust↔Rust: Rust's sender is the bottleneck there and spends more CPU per byte towards jiroh
+(and towards a plain noq client) than towards iroh's own receiver. The machine runs a VM alongside, so absolute
+numbers vary by 5–15% between runs (Rust↔Rust has measured 640–700).

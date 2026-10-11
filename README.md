@@ -16,5 +16,20 @@ cd jiroh && ./gradlew test
 Java 25. The fast Linux UDP path (GSO/GRO through FFM) needs `--enable-native-access=ALL-UNNAMED`; without it a
 DatagramChannel is used.
 
-The Rust interop tests need the `interop-probe` binaries and n0's `iroh-relay`; they are skipped when those are not
-built. `bench.sh` measures throughput against Rust iroh.
+The Rust interop tests need the [interop-probe](https://github.com/peergos/iroh-interop-probe) binaries (cloned as
+`interop-probe` next to jiroh) and n0's `iroh-relay`; they are skipped when those are not built.
+
+## Throughput
+
+`./bench.sh [bytes] [streams] [java opts]` runs every pairing of Rust iroh and jiroh over loopback. One bidirectional
+stream, 512 MiB, best of 5 runs, MiB/s (Ryzen 9 7940HS, Linux 6.8, Java 25, iroh 1.3):
+
+| client → server | upload | download |
+|---|---|---|
+| Rust iroh → Rust iroh | 701 | 686 |
+| jiroh → Rust iroh | 739 | 571 |
+| Rust iroh → jiroh | 510 | 678 |
+| jiroh → jiroh | 668 | 639 |
+
+jiroh sends at or above Rust iroh's rate. Receiving from Rust iroh is slower: about what a plain (non-iroh) noq
+client gets, while iroh's own receiver gets more from its socket layer. Numbers vary by about 5% between runs.

@@ -254,70 +254,65 @@ final class LinuxUdp implements Udp {
         }
     }
 
+    // Receive state, allocated on the first receive; only the receiving thread uses it.
+    private Arena receiveArena;
+    private MemorySegment receiveMsg, receiveName, receiveControl, receiveBuffer, receiveState;
+
     @Override
-    public void receiveLoop(Sink sink) throws IOException {
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment msg = arena.allocate(MSGHDR, 8);
-            MemorySegment iov = arena.allocate(IOVEC, 8);
-            MemorySegment name = arena.allocate(SOCKADDR_IN6, 8);
-            MemorySegment control = arena.allocate(CONTROL, 8);
-            MemorySegment buffer = arena.allocate(BUFFER, 8);
-            MemorySegment state = arena.allocate(CAPTURE);
-            iov.set(ADDRESS, 0, buffer);
+    public Batch receive(boolean blocking) throws IOException {
+        if (receiveArena == null) {
+            receiveArena = Arena.ofAuto();
+            receiveMsg = receiveArena.allocate(MSGHDR, 8);
+            MemorySegment iov = receiveArena.allocate(IOVEC, 8);
+            receiveName = receiveArena.allocate(SOCKADDR_IN6, 8);
+            receiveControl = receiveArena.allocate(CONTROL, 8);
+            receiveBuffer = receiveArena.allocate(BUFFER, 8);
+            receiveState = receiveArena.allocate(CAPTURE);
+            iov.set(ADDRESS, 0, receiveBuffer);
             iov.set(JAVA_LONG, 8, BUFFER);
-            // Each batch is handed over once the next read shows whether more were already queued.
-            InetSocketAddress pendingSource = null;
-            byte[] pending = null;
-            int pendingSegmentSize = 0;
-            while (!closed) {
-                msg.fill((byte) 0);
-                msg.set(ADDRESS, 0, name);
-                msg.set(JAVA_INT, 8, SOCKADDR_IN6);
-                msg.set(ADDRESS, 16, iov);
-                msg.set(JAVA_LONG, 24, 1);
-                msg.set(ADDRESS, 32, control);
-                msg.set(JAVA_LONG, 40, CONTROL);
-                long received;
-                try {
-                    received = (long) RECVMSG.invokeExact(state, fd, msg, pending == null ? 0 : MSG_DONTWAIT);
+            receiveMsg.set(ADDRESS, 16, iov);
+        }
+        MemorySegment msg = receiveMsg;
+        while (true) {
+            if (closed) {
+                throw new SocketException("Socket is closed");
+            }
+            msg.set(ADDRESS, 0, receiveName);
+            msg.set(JAVA_INT, 8, SOCKADDR_IN6);
+            msg.set(JAVA_LONG, 24, 1);
+            msg.set(ADDRESS, 32, receiveControl);
+            msg.set(JAVA_LONG, 40, CONTROL);
+            msg.set(JAVA_INT, 48, 0);
+            long received;
+            try {
+                received = (long) RECVMSG.invokeExact(receiveState, fd, msg, blocking ? 0 : MSG_DONTWAIT);
+            }
+            catch (Throwable t) {
+                throw new IllegalStateException(t);
+            }
+            if (closed) {
+                throw new SocketException("Socket is closed");
+            }
+            if (received < 0) {
+                int errno = (int) ERRNO.get(receiveState, 0L);
+                if (errno == EAGAIN && !blocking) {
+                    return null;
                 }
-                catch (Throwable t) {
-                    throw new IllegalStateException(t);
-                }
-                if (received < 0) {
-                    int errno = (int) ERRNO.get(state, 0L);
-                    if (closed) {
-                        return;
-                    }
-                    if (errno == EAGAIN && pending != null) {
-                        sink.received(pendingSource, pending, pending.length, pendingSegmentSize, false);
-                        pending = null;
-                        continue;
-                    }
-                    if (errno == EINTR) {
-                        continue;
-                    }
-                    throw new NativeError("recvmsg", errno);
-                }
-                if (closed) {
-                    return;
-                }
-                if (msg.get(JAVA_INT, 8) == 0) {
-                    // No source address: woken by shutdown.
+                if (errno == EINTR) {
                     continue;
                 }
-                InetSocketAddress source = readSockaddr(name);
-                int segmentSize = groSegmentSize(control, msg.get(JAVA_LONG, 40));
-                int length = (int) received;
-                byte[] data = new byte[length];
-                MemorySegment.copy(buffer, JAVA_BYTE, 0, data, 0, length);
-                if (pending != null) {
-                    sink.received(pendingSource, pending, pending.length, pendingSegmentSize, true);
-                }
-                pendingSource = source;
-                pending = data;
-                pendingSegmentSize = segmentSize <= 0 || segmentSize > length ? length : segmentSize;
+                throw new NativeError("recvmsg", errno);
             }
+            if (msg.get(JAVA_INT, 8) == 0) {
+                // No source address: woken by shutdown.
+                continue;
+            }
+            InetSocketAddress source = readSockaddr(receiveName);
+            int segmentSize = groSegmentSize(receiveControl, msg.get(JAVA_LONG, 40));
+            int length = (int) received;
+            byte[] data = new byte[length];
+            MemorySegment.copy(receiveBuffer, JAVA_BYTE, 0, data, 0, length);
+            return new Batch(source, data, length, segmentSize <= 0 || segmentSize > length ? length : segmentSize);
         }
     }
 

@@ -10,9 +10,9 @@ import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.SocketException;
 import java.util.List;
-import java.util.concurrent.BlockingQueue;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * The single socket of an endpoint, as kwik sees it: datagrams go over UDP, or over a {@link PacketTransport} (e.g.
@@ -21,28 +21,28 @@ import java.util.concurrent.LinkedBlockingQueue;
  */
 public final class IrohSocket extends DatagramSocket implements SegmentedDatagramSocket {
 
-    private static final Received CLOSED = new Received(null, null, 0, 0, false);
-
     private final Udp udp;
     private final InetSocketAddress localAddress;
+    // Where a zero-length datagram wakes the thread blocked in receive, when a transport delivers a packet.
+    private final InetSocketAddress wakeAddress;
     private final List<PacketTransport> transports = new CopyOnWriteArrayList<>();
-    private final BlockingQueue<Received> incoming = new LinkedBlockingQueue<>();
-    private final Thread udpReader;
+    // Packets from transports (relays); UDP is read directly by the receiving thread.
+    private final Queue<Received> incoming = new ConcurrentLinkedQueue<>();
     private volatile boolean closed;
-    // The batch being handed out by receive(), which only kwik's receiver thread calls.
-    private Received current;
+    // Receive state; only kwik's receiver thread calls receive and moreReceived.
+    private Udp.Batch current;
     private int currentOffset;
-    private boolean lastBatchHadMore;
+    private Udp.Batch prefetched;
 
-    private record Received(InetSocketAddress source, byte[] data, int length, int segmentSize, boolean more) {}
+    private record Received(InetSocketAddress source, byte[] data) {}
 
     public IrohSocket(InetSocketAddress bindAddress) throws IOException {
         // The superclass socket is never bound or used; every method kwik calls is overridden.
         super((SocketAddress) null);
         udp = Udp.bind(bindAddress);
         localAddress = udp.localAddress();
-        // A platform thread: the native socket blocks in recvmsg, which would pin a virtual thread's carrier.
-        udpReader = Thread.ofPlatform().daemon().name("iroh-udp-" + localAddress.getPort()).start(this::readUdp);
+        InetAddress local = localAddress.getAddress();
+        wakeAddress = new InetSocketAddress(local.isAnyLocalAddress()? InetAddress.getLoopbackAddress(): local, localAddress.getPort());
     }
 
     public void addTransport(PacketTransport transport) {
@@ -51,20 +51,23 @@ public final class IrohSocket extends DatagramSocket implements SegmentedDatagra
             if (!closed) {
                 byte[] copy = new byte[length];
                 System.arraycopy(data, offset, copy, 0, length);
-                incoming.add(new Received(source, copy, length, length, false));
+                incoming.add(new Received(source, copy));
+                wake();
             }
         });
     }
 
-    private void readUdp() {
+    private void wake() {
         try {
-            udp.receiveLoop((source, data, length, segmentSize, more) -> incoming.add(new Received(source, data, length, segmentSize, more)));
+            udp.send(new byte[0], 0, 0, wakeAddress);
         }
         catch (IOException e) {
-            if (!closed) {
-                close();
-            }
+            // Closed, or the packet is picked up with the next UDP datagram.
         }
+    }
+
+    private boolean isWake(Udp.Batch batch) {
+        return batch.length() == 0 && batch.source().getPort() == localAddress.getPort();
     }
 
     @Override
@@ -114,36 +117,54 @@ public final class IrohSocket extends DatagramSocket implements SegmentedDatagra
 
     @Override
     public DatagramPacket receive() throws IOException {
-        if (current == null) {
-            Received received;
-            try {
-                received = incoming.take();
+        while (true) {
+            Udp.Batch batch = current;
+            if (batch != null) {
+                int segment = Math.min(batch.segmentSize(), batch.length() - currentOffset);
+                DatagramPacket packet = new DatagramPacket(batch.data(), currentOffset, segment, batch.source());
+                currentOffset += segment;
+                if (currentOffset >= batch.length()) {
+                    current = null;
+                }
+                return packet;
             }
-            catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new SocketException("interrupted");
+            Received relayed = incoming.poll();
+            if (relayed != null) {
+                return new DatagramPacket(relayed.data, 0, relayed.data.length, relayed.source);
             }
-            if (received == CLOSED) {
-                incoming.add(CLOSED);
+            if (closed) {
                 throw new SocketException("Socket is closed");
             }
-            current = received;
-            currentOffset = 0;
+            batch = prefetched != null? prefetched: udp.receive(true);
+            prefetched = null;
+            if (!isWake(batch)) {
+                current = batch;
+                currentOffset = 0;
+            }
         }
-        Received received = current;
-        int segment = Math.min(received.segmentSize, received.length - currentOffset);
-        DatagramPacket packet = new DatagramPacket(received.data, currentOffset, segment, received.source);
-        currentOffset += segment;
-        if (currentOffset >= received.length) {
-            current = null;
-            lastBatchHadMore = received.more;
-        }
-        return packet;
     }
 
     @Override
     public boolean moreReceived() {
-        return current != null || lastBatchHadMore || !incoming.isEmpty();
+        if (current != null || prefetched != null || !incoming.isEmpty()) {
+            return true;
+        }
+        try {
+            Udp.Batch batch;
+            while ((batch = udp.receive(false)) != null) {
+                if (!isWake(batch)) {
+                    prefetched = batch;
+                    return true;
+                }
+                if (!incoming.isEmpty()) {
+                    return true;
+                }
+            }
+        }
+        catch (IOException e) {
+            // Closed: the next receive says so.
+        }
+        return false;
     }
 
     @Override
@@ -179,7 +200,6 @@ public final class IrohSocket extends DatagramSocket implements SegmentedDatagra
         closed = true;
         transports.forEach(PacketTransport::close);
         udp.close();
-        incoming.add(CLOSED);
         super.close();
     }
 }

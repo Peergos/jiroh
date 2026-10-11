@@ -2,6 +2,7 @@ package org.peergos.iroh;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.DatagramChannel;
@@ -34,8 +35,27 @@ interface Udp extends AutoCloseable {
         }
     }
 
+    /** Datagrams received together from one source: segmentSize bytes each, the last possibly shorter. */
+    record Batch(InetSocketAddress source, byte[] data, int length, int segmentSize) {}
+
+    /**
+     * Receives the next batch of datagrams. Blocks until one arrives, unless {@code blocking} is false, in which case
+     * it returns null when none is queued. Only one thread may receive. Throws once the socket is closed.
+     */
+    Batch receive(boolean blocking) throws IOException;
+
     /** Receives datagrams until the socket is closed. */
-    void receiveLoop(Sink sink) throws IOException;
+    default void receiveLoop(Sink sink) throws IOException {
+        try {
+            while (true) {
+                Batch batch = receive(true);
+                sink.received(batch.source(), batch.data(), batch.length(), batch.segmentSize(), false);
+            }
+        }
+        catch (SocketException closed) {
+            // closed
+        }
+    }
 
     @Override
     void close();
@@ -72,20 +92,23 @@ interface Udp extends AutoCloseable {
             channel.send(ByteBuffer.wrap(data, offset, length), destination);
         }
 
+        private final ByteBuffer buffer = ByteBuffer.allocate(65536);
+
         @Override
-        public void receiveLoop(Sink sink) throws IOException {
-            ByteBuffer buffer = ByteBuffer.allocate(65536);
+        public Batch receive(boolean blocking) throws IOException {
+            if (!blocking) {
+                return null;
+            }
+            buffer.clear();
+            InetSocketAddress source;
             try {
-                while (true) {
-                    buffer.clear();
-                    InetSocketAddress source = (InetSocketAddress) channel.receive(buffer);
-                    int length = buffer.position();
-                    sink.received(source, Arrays.copyOf(buffer.array(), length), length, length, false);
-                }
+                source = (InetSocketAddress) channel.receive(buffer);
             }
             catch (ClosedChannelException e) {
-                // closed
+                throw new SocketException("Socket is closed");
             }
+            int length = buffer.position();
+            return new Batch(source, Arrays.copyOf(buffer.array(), length), length, length);
         }
 
         @Override

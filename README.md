@@ -1,8 +1,8 @@
 # jiroh
 
 A Java implementation of [iroh](https://github.com/n0-computer/iroh) endpoints, interoperable with Rust iroh 1.x:
-QUIC with raw public key TLS, iroh relays, QUIC address discovery, pkarr lookup on the mainline DHT, and multipath
-(draft-ietf-quic-multipath-21).
+QUIC with raw public key TLS, iroh relays, QUIC address discovery, pkarr lookup on the mainline DHT, multipath
+(draft-ietf-quic-multipath-21), iroh's QUIC NAT traversal (hole punching) and port mapping (PCP, NAT-PMP, UPnP).
 
 It builds against Peergos's forks of kwik (QUIC) and agent15 (TLS 1.3), branch `iroh`, cloned next to it:
 
@@ -18,6 +18,14 @@ DatagramChannel is used.
 
 The Rust interop tests need the [interop-probe](https://github.com/peergos/iroh-interop-probe) binaries (cloned as
 `interop-probe` next to jiroh) and n0's `iroh-relay`; they are skipped when those are not built.
+
+## NAT traversal
+
+`./nat-test.sh [java|rust] [java|rust] [portmap]` puts a server and a client behind two Linux NATs (masquerading
+in network namespaces, no root needed) with an iroh relay between them. The client knows only the server's relay,
+and the test passes when NAT traversal finds a direct path. Either side can be jiroh or Rust iroh. With `portmap`,
+the server's NAT maps ports over PCP and uses random ports for outgoing traffic, so the server can only be reached
+at its mapped address.
 
 ## Throughput
 

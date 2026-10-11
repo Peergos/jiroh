@@ -611,13 +611,19 @@ public final class Endpoint implements AutoCloseable {
         return connection;
     }
 
-    /** kwik's errors go to java.util.logging; with -Djiroh.kwik.log=true, its warnings and errors go to stdout. */
+    /**
+     * kwik's errors go to java.util.logging; with -Djiroh.kwik.log=true, its warnings and errors go to stdout, with
+     * =info also its info messages, and with =packets also every packet.
+     */
     static tech.kwik.core.log.Logger kwikLogger() {
-        if (!Boolean.getBoolean("jiroh.kwik.log")) {
+        String level = System.getProperty("jiroh.kwik.log", "false");
+        if (level.equals("false")) {
             return new KwikLog();
         }
         tech.kwik.core.log.SysOutLogger log = new tech.kwik.core.log.SysOutLogger();
         log.logWarning(true);
+        log.logInfo(level.equals("info") || level.equals("packets"));
+        log.logPackets(level.equals("packets"));
         return log;
     }
 

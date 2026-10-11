@@ -138,6 +138,45 @@ class RelayInteropTest {
     }
 
     @Test
+    void natTraversalShouldFindADirectPathToRustIroh() throws Exception {
+        Assumptions.assumeTrue(Files.isExecutable(PROBE.resolve("server")), "interop-probe not built");
+        SecretKey serverKey = SecretKey.generate();
+        Process server = new ProcessBuilder(PROBE.resolve("server").toString(), "127.0.0.1:0",
+                HexFormat.of().formatHex(serverKey.toBytes()), relay.url.toString())
+                .redirectErrorStream(true)
+                .start();
+        try {
+            BufferedReader out = new BufferedReader(new InputStreamReader(server.getInputStream()));
+            waitForLine(out, "relay: ");
+
+            SecretKey clientKey = SecretKey.generate();
+            RelayTransport transport = connect(clientKey);
+            try (Endpoint client = Endpoint.bind(clientKey, LOCALHOST, Map.of(), List.of(transport))) {
+                QuicClientConnection connection = client.connect(serverKey.endpointId(),
+                        transport.addressFor(serverKey.endpointId()), EchoProtocol.ALPN);
+                QuicConnectionImpl impl = (QuicConnectionImpl) connection;
+                CompletableFuture<QuicPath> direct = new CompletableFuture<>();
+                impl.setPathListener(path -> {
+                    if (!MappedAddresses.isRelayMapped(path.getPeerAddress())) {
+                        direct.complete(path);
+                    }
+                });
+                assertEquals("relayed", EchoProtocol.echo(connection, "relayed"));
+                assertTrue(impl.isNatTraversalEnabled());
+                // iroh advertises its address with ADD_ADDRESS; the round's probe to it is answered, opening a path.
+                QuicPath path = direct.get(10, TimeUnit.SECONDS);
+                assertTrue(impl.getRemoteNatTraversalAddresses().contains(path.getPeerAddress()), impl.getRemoteNatTraversalAddresses().toString());
+                assertEquals("direct", EchoProtocol.echo(connection, "direct"));
+                connection.close();
+            }
+        }
+        finally {
+            server.destroy();
+            server.waitFor(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     void rustIrohShouldConnectToJavaViaRelay() throws Exception {
         Assumptions.assumeTrue(Files.isExecutable(PROBE.resolve("iroh_client")), "interop-probe not built");
         SecretKey serverKey = SecretKey.generate();

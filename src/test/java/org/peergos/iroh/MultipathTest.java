@@ -56,7 +56,7 @@ class MultipathTest {
         FakeRelay.Client relayA = relay.client(keyA.endpointId());
         FakeRelay.Client relayB = relay.client(keyB.endpointId());
         EchoProtocol echo = new EchoProtocol();
-        try (Endpoint a = Endpoint.builder(keyA).bind(LOCALHOST).publish(false).relayQuicPort(null).maxPathId(2)
+        try (Endpoint a = Endpoint.builder(keyA).bind(LOCALHOST).natTraversal(false).publish(false).relayQuicPort(null).maxPathId(2)
                      .transport(relayA).build();
              Endpoint b = Endpoint.builder(keyB).bind(LOCALHOST).publish(false).relayQuicPort(null).maxPathId(2)
                      .transport(relayB).protocol(EchoProtocol.ALPN, echo).build()) {
@@ -91,7 +91,7 @@ class MultipathTest {
         FakeRelay.Client relayA = relay.client(keyA.endpointId());
         FakeRelay.Client relayB = relay.client(keyB.endpointId());
         EchoProtocol echo = new EchoProtocol();
-        try (Endpoint a = Endpoint.builder(keyA).bind(LOCALHOST).publish(false).relayQuicPort(null)
+        try (Endpoint a = Endpoint.builder(keyA).bind(LOCALHOST).natTraversal(false).publish(false).relayQuicPort(null)
                      .transport(relayA).build();
              Endpoint b = Endpoint.builder(keyB).bind(LOCALHOST).publish(false).relayQuicPort(null)
                      .transport(relayB).protocol(EchoProtocol.ALPN, echo).build()) {
@@ -136,7 +136,7 @@ class MultipathTest {
         FakeRelay.Client relayA = relay.client(keyA.endpointId());
         FakeRelay.Client relayB = relay.client(keyB.endpointId());
         EchoProtocol echo = new EchoProtocol();
-        try (Endpoint a = Endpoint.builder(keyA).bind(LOCALHOST).publish(false).relayQuicPort(null).transport(relayA).build();
+        try (Endpoint a = Endpoint.builder(keyA).bind(LOCALHOST).natTraversal(false).publish(false).relayQuicPort(null).transport(relayA).build();
              Endpoint b = Endpoint.builder(keyB).bind(LOCALHOST).publish(false).relayQuicPort(null).transport(relayB)
                      .protocol(EchoProtocol.ALPN, echo).build()) {
             QuicClientConnection connection = a.connect(b.id(), relayA.addressFor(b.id()), EchoProtocol.ALPN);

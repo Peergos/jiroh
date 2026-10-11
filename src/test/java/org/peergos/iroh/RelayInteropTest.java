@@ -183,10 +183,14 @@ class RelayInteropTest {
             }
             assertEquals(0, client.exitValue(), output);
             assertTrue(output.contains("echo ok: after linger"), output);
-            // iroh dialled the direct address as path 0 and opened path 1 over the relay, validating it both ways.
-            assertTrue(output.contains("client path event: Opened { id: PathId(1), remote_addr: Relay("), output);
-            String path1 = output.substring(output.indexOf("Closed { id: PathId(1)"));
-            assertTrue(path1.contains("frame_rx: FrameStats {") && path1.substring(path1.indexOf("frame_rx")).contains("PATH_RESPONSE: 1"), output);
+            // iroh dialled the direct address as path 0 and opened a path over the relay, validating it both ways. With
+            // NAT traversal it also opens paths from its other local addresses, so the relay path's id varies.
+            java.util.regex.Matcher relayPath = java.util.regex.Pattern.compile("Opened \\{ id: PathId\\((\\d+)\\), remote_addr: Relay\\(").matcher(output);
+            assertTrue(relayPath.find(), output);
+            String closed = output.substring(output.indexOf("Closed { id: PathId(" + relayPath.group(1) + ")"));
+            assertTrue(closed.contains("frame_rx: FrameStats {") && closed.substring(closed.indexOf("frame_rx")).contains("PATH_RESPONSE: 1"), output);
+            // iroh sent REACH_OUT frames, and got the server's address in ADD_ADDRESS.
+            assertTrue(output.matches("(?s).*REACH_OUT: [1-9].*") && output.matches("(?s).*ADD_ADDRESS: [1-9].*"), output);
         }
     }
 

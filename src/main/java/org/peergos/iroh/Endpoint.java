@@ -73,6 +73,7 @@ public final class Endpoint implements AutoCloseable {
     private final long streamReceiveWindow;
     private final long maxPathId;
     private final Pkarr pkarr;
+    private final NatTraversal natTraversal;
     private final Map<URI, RelayTransport> relays = new ConcurrentHashMap<>();
     private record ConnectionKey(EndpointId remote, String alpn) {}
     private final Map<ConnectionKey, CompletableFuture<QuicClientConnection>> connections = new ConcurrentHashMap<>();
@@ -96,6 +97,7 @@ public final class Endpoint implements AutoCloseable {
             t.setDaemon(true);
             return t;
         });
+        this.natTraversal = builder.natTraversal? new NatTraversal(() -> addr().directAddresses(), scheduler): null;
     }
 
     public static Builder builder(SecretKey secretKey) {
@@ -115,6 +117,7 @@ public final class Endpoint implements AutoCloseable {
         private Integer relayQuicPort = QuicAddressDiscovery.DEFAULT_RELAY_QUIC_PORT;
         private long streamReceiveWindow = DEFAULT_STREAM_RECEIVE_WINDOW;
         private long maxPathId = DEFAULT_MAX_PATH_ID;
+        private boolean natTraversal = true;
 
         private Builder(SecretKey secretKey) {
             this.secretKey = secretKey;
@@ -176,6 +179,12 @@ public final class Endpoint implements AutoCloseable {
             return this;
         }
 
+        /** Whether to use iroh's QUIC NAT traversal to find direct paths (on by default). */
+        public Builder natTraversal(boolean natTraversal) {
+            this.natTraversal = natTraversal;
+            return this;
+        }
+
         public Builder timeout(Duration timeout) {
             this.timeout = timeout;
             return this;
@@ -185,6 +194,17 @@ public final class Endpoint implements AutoCloseable {
             IrohSocket socket = new IrohSocket(bindAddress);
             transports.forEach(socket::addTransport);
             ServerConnector server;
+            ServerConnectionConfig.Builder config = ServerConnectionConfig.builder()
+                    .maxIdleTimeoutInSeconds((int) MAX_IDLE_TIMEOUT.toSeconds())
+                    .multipath(maxPathId)
+                    .maxOpenPeerInitiatedBidirectionalStreams(100)
+                    .maxOpenPeerInitiatedUnidirectionalStreams(100)
+                    .maxBidirectionalStreamBufferSize(streamReceiveWindow)
+                    .maxUnidirectionalStreamBufferSize(streamReceiveWindow)
+                    .maxConnectionBufferSize(10 * streamReceiveWindow);
+            if (natTraversal) {
+                config.natTraversal(NatTraversal.MAX_ADDRESSES);
+            }
             try {
                 server = ServerConnector.builder()
                         .withSocket(socket)
@@ -192,24 +212,16 @@ public final class Endpoint implements AutoCloseable {
                         .withRawPublicKey(secretKey.keyPair())
                         // iroh authenticates every client, and accepts any key: authorisation is up to the protocol.
                         .requireClientRawPublicKey(key -> true)
-                        .withConfiguration(ServerConnectionConfig.builder()
-                                .maxIdleTimeoutInSeconds((int) MAX_IDLE_TIMEOUT.toSeconds())
-                                .multipath(maxPathId)
-                                .maxOpenPeerInitiatedBidirectionalStreams(100)
-                                .maxOpenPeerInitiatedUnidirectionalStreams(100)
-                                .maxBidirectionalStreamBufferSize(streamReceiveWindow)
-                                .maxUnidirectionalStreamBufferSize(streamReceiveWindow)
-                                .maxConnectionBufferSize(10 * streamReceiveWindow)
-                                .build())
+                        .withConfiguration(config.build())
                         .build();
             }
             catch (CertificateException e) {
                 socket.close();
                 throw new IllegalStateException(e);
             }
-            protocols.forEach((alpn, handler) -> server.registerApplicationProtocol(alpn, new Factory(handler)));
-            server.start();
             Endpoint endpoint = new Endpoint(this, socket, server);
+            protocols.forEach((alpn, handler) -> server.registerApplicationProtocol(alpn, endpoint.new Factory(handler)));
+            server.start();
             try {
                 endpoint.start(relayUrls, publish);
             }
@@ -240,6 +252,7 @@ public final class Endpoint implements AutoCloseable {
             if (homeRelay != null && relayQuicPort != null) {
                 observedAddress = discoverAddress(homeRelay).orElse(null);
             }
+            directAddressesChanged();
         }
         if (pkarr != null && publish) {
             publishNow();
@@ -292,6 +305,12 @@ public final class Endpoint implements AutoCloseable {
             socket.addTransport(transport);
             relays.put(url, transport);
             return transport;
+        }
+    }
+
+    private void directAddressesChanged() {
+        if (natTraversal != null) {
+            natTraversal.candidatesChanged();
         }
     }
 
@@ -465,6 +484,7 @@ public final class Endpoint implements AutoCloseable {
             if (candidates.size() > 1) {
                 Thread.ofVirtual().start(() -> openExtraPaths(connection, candidates));
             }
+            startNatTraversal(connection);
             return connection;
         }
         catch (InterruptedException e) {
@@ -560,7 +580,15 @@ public final class Endpoint implements AutoCloseable {
      * endpoint's transports.
      */
     public QuicClientConnection connect(EndpointId remote, InetSocketAddress address, String alpn) throws IOException {
-        return connectVia(remote, address, alpn);
+        QuicClientConnection connection = connectVia(remote, address, alpn);
+        startNatTraversal(connection);
+        return connection;
+    }
+
+    private void startNatTraversal(QuicClientConnection connection) {
+        if (natTraversal != null && connection instanceof QuicConnectionImpl impl) {
+            natTraversal.clientConnection(impl);
+        }
     }
 
     private QuicClientConnection connectVia(EndpointId remote, InetSocketAddress address, String alpn) throws IOException {
@@ -576,6 +604,7 @@ public final class Endpoint implements AutoCloseable {
                 .defaultStreamReceiveBufferSize(streamReceiveWindow)
                 .sharedEndpoint(server.getSharedEndpoint())
                 .multipath(maxPathId)
+                .natTraversal(natTraversal != null? NatTraversal.MAX_ADDRESSES: 0)
                 .logger(kwikLogger())
                 .build();
         connection.connect();
@@ -606,9 +635,18 @@ public final class Endpoint implements AutoCloseable {
         socket.close();
     }
 
-    private record Factory(ProtocolHandler handler) implements ApplicationProtocolConnectionFactory {
+    private final class Factory implements ApplicationProtocolConnectionFactory {
+        private final ProtocolHandler handler;
+
+        Factory(ProtocolHandler handler) {
+            this.handler = handler;
+        }
+
         @Override
         public ApplicationProtocolConnection createConnection(String protocol, QuicConnection connection) {
+            if (natTraversal != null && connection instanceof QuicConnectionImpl impl) {
+                natTraversal.serverConnection(impl);
+            }
             EndpointId remote = EndpointId.fromPublicKey(connection.getPeerRawPublicKey());
             InetSocketAddress remoteAddress = ((ServerConnection) connection).getInitialRemoteAddress();
             return new ApplicationProtocolConnection() {

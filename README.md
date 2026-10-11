@@ -22,17 +22,15 @@ The Rust interop tests need the [interop-probe](https://github.com/peergos/iroh-
 ## Throughput
 
 `./bench.sh [bytes] [streams] [java opts]` runs every pairing of Rust iroh and jiroh over loopback. One bidirectional
-stream, 512 MiB, best of 5 runs, MiB/s (Ryzen 9 7940HS, Linux 6.8, Java 25, iroh 1.3):
+stream, 512 MiB, best of several runs, MiB/s (Ryzen 9 7940HS, Linux 6.8, Java 25, iroh 1.3):
 
 | client → server | upload | download |
 |---|---|---|
-| Rust iroh → Rust iroh | 639 | 639 |
-| jiroh → Rust iroh | 814 | 443 |
-| Rust iroh → jiroh | 482 | 695 |
-| jiroh → jiroh | 759 | 665 |
+| Rust iroh → Rust iroh | 744 | 731 |
+| jiroh → Rust iroh | 900 | 623 |
+| Rust iroh → jiroh | 573 | 793 |
+| jiroh → jiroh | 852 | 813 |
 
-jiroh sends faster than Rust iroh, and jiroh to jiroh beats Rust iroh to Rust iroh: interleaving the two (same
-machine load), jiroh↔jiroh got 695–767 up and 641–697 down against 642–661 and 586–649. Receiving from Rust iroh
-is slower, 73–87% of Rust↔Rust: Rust's sender is the bottleneck there and spends more CPU per byte towards jiroh
-(and towards a plain noq client) than towards iroh's own receiver. The machine runs a VM alongside, so absolute
-numbers vary by 5–15% between runs (Rust↔Rust has measured 640–700).
+jiroh sends faster than Rust iroh, and jiroh to jiroh beats Rust iroh to Rust iroh by about 12–15%. Receiving from
+Rust iroh is slower, 77–85% of Rust↔Rust: Rust's sender is the bottleneck there and spends more CPU per byte towards
+jiroh (and towards a plain noq client) than towards iroh's own receiver. Repeated runs agree to within about 3%.

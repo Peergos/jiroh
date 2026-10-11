@@ -8,6 +8,7 @@ import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.StructLayout;
 import java.lang.foreign.SymbolLookup;
+import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.VarHandle;
 import java.net.Inet4Address;
@@ -38,6 +39,8 @@ final class LinuxUdp implements Udp {
     private static final int SHUT_RDWR = 2, EINTR = 4, EIO = 5, EAGAIN = 11, MSG_DONTWAIT = 0x40;
     private static final int SOCKADDR_IN6 = 28, MSGHDR = 56, IOVEC = 16, CONTROL = 64;
     private static final int MAX_SEGMENTS = 64;
+    // A constant: a layout made per call costs a lookup of its accessor every time.
+    private static final ValueLayout.OfShort PORT = JAVA_SHORT.withOrder(ByteOrder.BIG_ENDIAN);
     private static final int BUFFER = 65536;
     private static final int SOCKET_BUFFER = 8 * 1024 * 1024;
 
@@ -350,7 +353,7 @@ final class LinuxUdp implements Udp {
     private static void writeSockaddr(MemorySegment addr, InetSocketAddress address) {
         addr.fill((byte) 0);
         addr.set(JAVA_SHORT, 0, (short) AF_INET6);
-        addr.set(JAVA_SHORT.withOrder(ByteOrder.BIG_ENDIAN), 2, (short) address.getPort());
+        addr.set(PORT, 2, (short) address.getPort());
         InetAddress ip = address.getAddress();
         if (ip.isAnyLocalAddress()) {
             return;
@@ -368,7 +371,7 @@ final class LinuxUdp implements Udp {
     }
 
     private static InetSocketAddress readSockaddr(MemorySegment addr) {
-        int port = Short.toUnsignedInt(addr.get(JAVA_SHORT.withOrder(ByteOrder.BIG_ENDIAN), 2));
+        int port = Short.toUnsignedInt(addr.get(PORT, 2));
         byte[] bytes = addr.asSlice(8, 16).toArray(JAVA_BYTE);
         try {
             boolean mapped = true;

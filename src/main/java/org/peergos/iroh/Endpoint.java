@@ -1,5 +1,6 @@
 package org.peergos.iroh;
 
+import org.peergos.iroh.mdns.MdnsAddressLookup;
 import org.peergos.iroh.pkarr.EndpointInfo;
 import org.peergos.iroh.pkarr.MainlineDht;
 import org.peergos.iroh.pkarr.Pkarr;
@@ -47,7 +48,8 @@ import java.util.logging.Logger;
 /**
  * An iroh endpoint: QUIC with iroh's TLS (mutually authenticated Ed25519 raw public keys, no SNI) over one UDP
  * socket plus relay paths. It picks a home relay, learns its public address with QUIC address discovery, publishes
- * where it can be reached as a pkarr record on the mainline DHT, and dials other endpoints by id.
+ * where it can be reached as a pkarr record on the mainline DHT and, optionally, with mDNS on the local network, and
+ * dials other endpoints by id.
  *
  * Without QUIC multipath and NAT traversal, a connection stays on the path it was established on, so connecting
  * races the direct addresses against the relay and keeps the first handshake that completes.
@@ -77,6 +79,7 @@ public final class Endpoint implements AutoCloseable {
     private final long streamReceiveWindow;
     private final long maxPathId;
     private final Pkarr pkarr;
+    private final MdnsAddressLookup mdns;
     private final NatTraversal natTraversal;
     private final PortMapper portMapper;
     private final boolean publish;
@@ -90,7 +93,7 @@ public final class Endpoint implements AutoCloseable {
     private final java.util.Random random = new java.util.Random();
     private volatile EndpointInfo published;
 
-    private Endpoint(Builder builder, IrohSocket socket, ServerConnector server) {
+    private Endpoint(Builder builder, IrohSocket socket, ServerConnector server, MdnsAddressLookup mdns) {
         this.secretKey = builder.secretKey;
         this.socket = socket;
         this.server = server;
@@ -100,6 +103,7 @@ public final class Endpoint implements AutoCloseable {
         this.streamReceiveWindow = builder.streamReceiveWindow;
         this.maxPathId = builder.maxPathId;
         this.pkarr = builder.dht == null? null: new Pkarr(builder.dht);
+        this.mdns = mdns;
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "iroh-endpoint-" + secretKey.endpointId().toHex().substring(0, 8));
             t.setDaemon(true);
@@ -136,6 +140,7 @@ public final class Endpoint implements AutoCloseable {
         private long maxPathId = DEFAULT_MAX_PATH_ID;
         private boolean natTraversal = true;
         private boolean portMapping = true;
+        private boolean mdns = false;
 
         private Builder(SecretKey secretKey) {
             this.secretKey = secretKey;
@@ -171,6 +176,12 @@ public final class Endpoint implements AutoCloseable {
         /** Mainline DHT client for pkarr: resolving other endpoints, and publishing this one unless disabled. */
         public Builder addressLookup(MainlineDht dht) {
             this.dht = dht;
+            return this;
+        }
+
+        /** Whether to find, and be found by, endpoints on the local network with mDNS, as iroh's mdns address lookup. */
+        public Builder mdns(boolean mdns) {
+            this.mdns = mdns;
             return this;
         }
 
@@ -243,7 +254,15 @@ public final class Endpoint implements AutoCloseable {
                 socket.close();
                 throw new IllegalStateException(e);
             }
-            Endpoint endpoint = new Endpoint(this, socket, server);
+            MdnsAddressLookup lookup;
+            try {
+                lookup = mdns? MdnsAddressLookup.start(secretKey.endpointId(), MdnsAddressLookup.SERVICE_NAME, publish): null;
+            }
+            catch (IOException e) {
+                socket.close();
+                throw e;
+            }
+            Endpoint endpoint = new Endpoint(this, socket, server, lookup);
             protocols.forEach((alpn, handler) -> server.registerApplicationProtocol(alpn, endpoint.new Factory(handler)));
             server.start();
             try {
@@ -287,6 +306,9 @@ public final class Endpoint implements AutoCloseable {
         }
         if (portMapper != null || (homeRelay != null && relayQuicPort != null)) {
             scheduleRediscovery();
+        }
+        if (mdns != null) {
+            mdns.publish(addr());
         }
     }
 
@@ -370,6 +392,9 @@ public final class Endpoint implements AutoCloseable {
     private void directAddressesChanged() {
         if (natTraversal != null) {
             natTraversal.candidatesChanged();
+        }
+        if (mdns != null) {
+            mdns.publish(addr());
         }
         EndpointInfo current = published;
         if (pkarr != null && publish && current != null && !current.directAddresses().equals(addr().directAddresses())) {
@@ -477,7 +502,7 @@ public final class Endpoint implements AutoCloseable {
         return cached(new ConnectionKey(remote.id(), alpn), () -> connect(remote, alpn));
     }
 
-    /** Like {@link #connection(EndpointAddr, String)}, finding the endpoint's addresses with pkarr. */
+    /** Like {@link #connection(EndpointAddr, String)}, finding the endpoint's addresses with mDNS or pkarr. */
     public QuicClientConnection connection(EndpointId remote, String alpn) throws IOException {
         return cached(new ConnectionKey(remote, alpn), () -> connect(remote, alpn));
     }
@@ -511,15 +536,67 @@ public final class Endpoint implements AutoCloseable {
     }
 
     /**
-     * Connects to the given endpoint, finding its addresses with pkarr on the mainline DHT.
+     * Connects to the given endpoint, finding its addresses with mDNS on the local network and pkarr on the mainline
+     * DHT.
      */
     public QuicClientConnection connect(EndpointId remote, String alpn) throws IOException {
-        if (pkarr == null) {
+        return connect(lookup(remote), alpn);
+    }
+
+    /** The endpoint's addresses from whichever of mDNS and pkarr answers first. */
+    private EndpointAddr lookup(EndpointId remote) throws IOException {
+        if (pkarr == null && mdns == null) {
             throw new IOException("no address lookup configured");
         }
-        EndpointInfo info = pkarr.resolve(remote, timeout)
-                .orElseThrow(() -> new IOException("no address found for " + remote));
-        return connect(new EndpointAddr(remote, info.relayUrls(), info.directAddresses()), alpn);
+        if (mdns != null) {
+            Optional<EndpointAddr> local = mdns.discovered(remote);
+            if (local.isPresent()) {
+                return local.get();
+            }
+        }
+        List<java.util.function.Supplier<Optional<EndpointAddr>>> lookups = new ArrayList<>();
+        if (mdns != null) {
+            lookups.add(() -> mdns.resolve(remote, timeout));
+        }
+        if (pkarr != null) {
+            lookups.add(() -> pkarr.resolve(remote, timeout)
+                    .map(info -> new EndpointAddr(remote, info.relayUrls(), info.directAddresses())));
+        }
+        CompletableFuture<Optional<EndpointAddr>> found = new CompletableFuture<>();
+        AtomicInteger pending = new AtomicInteger(lookups.size());
+        // The slower lookup is left to finish: interrupting it could close the DHT's channel mid-send.
+        for (var lookup : lookups) {
+            Thread.ofVirtual().start(() -> {
+                Optional<EndpointAddr> result = Optional.empty();
+                try {
+                    result = lookup.get();
+                }
+                catch (RuntimeException e) {
+                    LOG.log(Level.FINE, "address lookup failed", e);
+                }
+                if (result.isPresent()) {
+                    found.complete(result);
+                }
+                else if (pending.decrementAndGet() == 0) {
+                    found.complete(Optional.empty());
+                }
+            });
+        }
+        try {
+            return found.get().orElseThrow(() -> new IOException("no address found for " + remote));
+        }
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException(e);
+        }
+        catch (ExecutionException e) {
+            throw new IOException(e.getCause());
+        }
+    }
+
+    /** The endpoint's mDNS address lookup, if enabled, e.g. to list the endpoints on the local network. */
+    public Optional<MdnsAddressLookup> mdns() {
+        return Optional.ofNullable(mdns);
     }
 
     /**
@@ -709,6 +786,9 @@ public final class Endpoint implements AutoCloseable {
     @Override
     public void close() {
         scheduler.shutdownNow();
+        if (mdns != null) {
+            mdns.close();
+        }
         if (portMapper != null) {
             portMapper.close();
         }

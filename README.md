@@ -1,8 +1,9 @@
 # jiroh
 
 A Java implementation of [iroh](https://github.com/n0-computer/iroh) endpoints, interoperable with Rust iroh 1.x:
-QUIC with raw public key TLS, iroh relays, QUIC address discovery, pkarr lookup on the mainline DHT, multipath
-(draft-ietf-quic-multipath-21), iroh's QUIC NAT traversal (hole punching) and port mapping (PCP, NAT-PMP, UPnP).
+QUIC with raw public key TLS, iroh relays, QUIC address discovery, pkarr lookup on the mainline DHT, mDNS discovery on
+the local network, multipath (draft-ietf-quic-multipath-21), iroh's QUIC NAT traversal (hole punching) and port
+mapping (PCP, NAT-PMP, UPnP).
 
 It builds against Peergos's forks of kwik (QUIC) and agent15 (TLS 1.3), branch `iroh`, cloned next to it:
 

@@ -2,10 +2,13 @@ package org.peergos.iroh;
 
 import static org.peergos.iroh.RelayProtocol.*;
 
+import com.sun.net.httpserver.HttpServer;
+
 import javax.net.ssl.ExtendedSSLSession;
 import javax.net.ssl.SSLSocket;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -25,15 +28,19 @@ import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadLocalRandom;
@@ -61,6 +68,8 @@ public final class RelayServer implements AutoCloseable {
 
     private final ServerSocket serverSocket;
     private final RelayCertificate certificate;
+    private final HttpServer metricsServer;
+    private final RelayMetrics metrics;
     private final Predicate<EndpointId> accessControl;
     private final SecureRandom random = new SecureRandom();
     private final ScheduledThreadPoolExecutor timer;
@@ -70,9 +79,11 @@ public final class RelayServer implements AutoCloseable {
     private final AtomicInteger keyMaterialAuthentications = new AtomicInteger();
     private volatile boolean closed;
 
-    private RelayServer(Builder config, ServerSocket serverSocket) {
+    private RelayServer(Builder config, ServerSocket serverSocket, HttpServer metricsServer) {
         this.serverSocket = serverSocket;
         this.certificate = config.certificate;
+        this.metricsServer = metricsServer;
+        this.metrics = config.metrics;
         this.accessControl = config.accessControl;
         this.timer = new ScheduledThreadPoolExecutor(1, r -> {
             Thread thread = new Thread(r, "iroh-relay-server-timer");
@@ -90,6 +101,8 @@ public final class RelayServer implements AutoCloseable {
     public static final class Builder {
         private InetSocketAddress bind = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
         private RelayCertificate certificate;
+        private InetSocketAddress metricsBind;
+        private RelayMetrics metrics = new RelayMetrics();
         private Predicate<EndpointId> accessControl = id -> true;
 
         private Builder() {}
@@ -106,6 +119,17 @@ public final class RelayServer implements AutoCloseable {
             return this;
         }
 
+        /** Serve the metrics as OpenMetrics text on http://metricsBind/metrics. */
+        public Builder metricsBind(InetSocketAddress metricsBind) {
+            this.metricsBind = metricsBind;
+            return this;
+        }
+
+        public Builder metrics(RelayMetrics metrics) {
+            this.metrics = metrics;
+            return this;
+        }
+
         /** Which endpoints may connect; others are sent ServerDeniesAuth. */
         public Builder accessControl(Predicate<EndpointId> accessControl) {
             this.accessControl = accessControl;
@@ -113,21 +137,52 @@ public final class RelayServer implements AutoCloseable {
         }
 
         public RelayServer start() throws IOException {
-            ServerSocket socket;
-            if (certificate == null) {
-                socket = new ServerSocket();
-            }
-            else {
-                try {
-                    socket = certificate.sslContext().getServerSocketFactory().createServerSocket();
+            List<AutoCloseable> opened = new ArrayList<>();
+            try {
+                ServerSocket socket;
+                if (certificate == null) {
+                    socket = new ServerSocket();
                 }
-                catch (GeneralSecurityException e) {
-                    throw new IOException(e);
+                else {
+                    try {
+                        socket = certificate.sslContext().getServerSocketFactory().createServerSocket();
+                    }
+                    catch (GeneralSecurityException e) {
+                        throw new IOException(e);
+                    }
                 }
+                opened.add(socket);
+                socket.setReuseAddress(true);
+                socket.bind(bind, 1024);
+                HttpServer metricsServer = null;
+                if (metricsBind != null) {
+                    metricsServer = HttpServer.create(metricsBind, 16);
+                    RelayMetrics metrics = this.metrics;
+                    metricsServer.createContext("/metrics", exchange -> {
+                        byte[] body = metrics.render().getBytes(StandardCharsets.UTF_8);
+                        exchange.getResponseHeaders().set("Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8");
+                        exchange.sendResponseHeaders(200, body.length);
+                        exchange.getResponseBody().write(body);
+                        exchange.close();
+                    });
+                    metricsServer.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+                    metricsServer.start();
+                    HttpServer started = metricsServer;
+                    opened.add(() -> started.stop(0));
+                }
+                return new RelayServer(this, socket, metricsServer);
             }
-            socket.setReuseAddress(true);
-            socket.bind(bind, 1024);
-            return new RelayServer(this, socket);
+            catch (IOException | RuntimeException e) {
+                for (AutoCloseable closeable : opened) {
+                    try {
+                        closeable.close();
+                    }
+                    catch (Exception ignored) {
+                        // closing what was opened
+                    }
+                }
+                throw e;
+            }
         }
     }
 
@@ -143,6 +198,15 @@ public final class RelayServer implements AutoCloseable {
             host = "[" + host + "]";
         }
         return URI.create((certificate != null? "https": "http") + "://" + host + ":" + address.getPort() + "/");
+    }
+
+    /** The metrics listener's address, when there is one. */
+    public Optional<InetSocketAddress> metricsAddress() {
+        return Optional.ofNullable(metricsServer).map(HttpServer::getAddress);
+    }
+
+    public RelayMetrics metrics() {
+        return metrics;
     }
 
     /** How many distinct endpoints are connected. */
@@ -167,6 +231,9 @@ public final class RelayServer implements AutoCloseable {
         }
         catch (IOException e) {
             // ignore
+        }
+        if (metricsServer != null) {
+            metricsServer.stop(0);
         }
         for (Socket socket : sockets) {
             closeQuietly(socket);
@@ -196,6 +263,8 @@ public final class RelayServer implements AutoCloseable {
     }
 
     private void serve(Socket socket) {
+        metrics.httpConnections.increment();
+        boolean errored = false;
         try (socket) {
             socket.setSoTimeout((int) HANDSHAKE_TIMEOUT.toMillis());
             socket.setTcpNoDelay(true);
@@ -223,12 +292,17 @@ public final class RelayServer implements AutoCloseable {
             }
         }
         catch (IOException | RuntimeException e) {
+            errored = !(e instanceof SocketException || e instanceof EOFException);
             if (!closed) {
                 LOG.log(Level.FINE, "relay connection from " + socket.getRemoteSocketAddress() + " ended", e);
             }
         }
         finally {
             sockets.remove(socket);
+            metrics.httpConnectionsClosed.increment();
+            if (errored) {
+                metrics.httpConnectionsErrored.increment();
+            }
         }
     }
 
@@ -278,7 +352,14 @@ public final class RelayServer implements AutoCloseable {
         }
         writeFrame(ws, new byte[]{SERVER_CONFIRMS_AUTH});
         socket.setSoTimeout(0);
-        new Client(id, protocol.equals(V2), socket, ws).run();
+        metrics.accepts.increment();
+        metrics.clientConnected(id);
+        try {
+            new Client(id, protocol.equals(V2), socket, ws).run();
+        }
+        finally {
+            metrics.disconnects.increment();
+        }
     }
 
     private static void badRequest(OutputStream out, Map<String, String> headers, String message) throws IOException {
@@ -419,6 +500,7 @@ public final class RelayServer implements AutoCloseable {
             }
             replaced[0] = registration.active;
             registration.inactive.push(registration.active);
+            metrics.clientsInactiveAdded.increment();
             registration.active = client;
             return registration;
         });
@@ -433,7 +515,9 @@ public final class RelayServer implements AutoCloseable {
         boolean[] gone = new boolean[1];
         clients.computeIfPresent(client.id, (id, registration) -> {
             if (registration.active != client) {
-                registration.inactive.remove(client);
+                if (registration.inactive.remove(client)) {
+                    metrics.clientsInactiveRemoved.increment();
+                }
                 return registration;
             }
             Client next = registration.inactive.poll();
@@ -441,6 +525,7 @@ public final class RelayServer implements AutoCloseable {
                 gone[0] = true;
                 return null;
             }
+            metrics.clientsInactiveRemoved.increment();
             registration.active = next;
             promoted[0] = next;
             return registration;
@@ -557,6 +642,8 @@ public final class RelayServer implements AutoCloseable {
                         throw new ProtocolException("malformed datagram frame");
                     }
                     EndpointId destination = EndpointId.fromBytes(Arrays.copyOfRange(frame, 1, 33));
+                    metrics.sendPacketsRecv.increment();
+                    metrics.bytesRecv.add(frame.length - 34 - (batch? 2: 0));
                     // The same layout with the source in place of the destination: [type][endpoint id][ecn][segment size][contents]
                     frame[0] = (byte) (batch? RELAY_TO_CLIENT_DATAGRAM_BATCH: RELAY_TO_CLIENT_DATAGRAM);
                     System.arraycopy(idBytes, 0, frame, 1, 32);
@@ -566,6 +653,7 @@ public final class RelayServer implements AutoCloseable {
                     if (buffer.remaining() != 8) {
                         throw new ProtocolException("malformed ping");
                     }
+                    metrics.gotPing.increment();
                     byte[] pong = new byte[9];
                     pong[0] = PONG;
                     buffer.get(pong, 1, 8);
@@ -580,13 +668,17 @@ public final class RelayServer implements AutoCloseable {
                         }
                     }
                 }
-                default -> LOG.fine("relay: ignoring frame type " + type + " from " + id);
+                default -> {
+                    metrics.unknownFrames.increment();
+                    LOG.fine("relay: ignoring frame type " + type + " from " + id);
+                }
             }
         }
 
         private void forward(EndpointId destination, byte[] frame) {
             Registration registration = clients.get(destination);
             if (registration == null) {
+                metrics.sendPacketsDropped.increment();
                 return;
             }
             if (registration.active.offer(new Outgoing(ServerWebSocket.BINARY, frame)) && recorded.add(destination)) {
@@ -626,6 +718,21 @@ public final class RelayServer implements AutoCloseable {
             }, PONG_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         }
 
+        private void countSent(byte[] frame) {
+            switch (frame[0]) {
+                case RELAY_TO_CLIENT_DATAGRAM -> {
+                    metrics.sendPacketsSent.increment();
+                    metrics.bytesSent.add(frame.length - 34);
+                }
+                case RELAY_TO_CLIENT_DATAGRAM_BATCH -> {
+                    metrics.sendPacketsSent.increment();
+                    metrics.bytesSent.add(frame.length - 36);
+                }
+                case PONG -> metrics.sentPong.increment();
+                default -> {}
+            }
+        }
+
         private void writeLoop() {
             try {
                 while (true) {
@@ -637,6 +744,9 @@ public final class RelayServer implements AutoCloseable {
                             return;
                         }
                         ws.write(next.opcode(), next.data(), 0, next.data().length);
+                        if (next.opcode() == ServerWebSocket.BINARY) {
+                            countSent(next.data());
+                        }
                     } while ((next = queue.poll()) != null);
                     ws.flush();
                 }
@@ -656,11 +766,13 @@ public final class RelayServer implements AutoCloseable {
     private static final String USAGE = String.join("\n",
             "usage: RelayServer [options]",
             "  --bind host:port          relay listener (443 with TLS, else 127.0.0.1:3340 plain HTTP)",
-            "  --cert chain.pem --key key.pem   a certificate and PKCS#8 key");
+            "  --cert chain.pem --key key.pem   a certificate and PKCS#8 key",
+            "  --metrics-bind host:port  serve OpenMetrics on /metrics");
 
     /** Runs a relay; see USAGE. Without a certificate it serves plain HTTP, for local testing only. */
     public static void main(String[] args) throws Exception {
         String bind = null;
+        String metricsBind = null;
         Path cert = null;
         Path key = null;
         try {
@@ -669,6 +781,7 @@ public final class RelayServer implements AutoCloseable {
                     case "--bind" -> bind = args[++i];
                     case "--cert" -> cert = Path.of(args[++i]);
                     case "--key" -> key = Path.of(args[++i]);
+                    case "--metrics-bind" -> metricsBind = args[++i];
                     default -> throw new IllegalArgumentException("unknown option " + args[i]);
                 }
             }
@@ -686,6 +799,9 @@ public final class RelayServer implements AutoCloseable {
         Builder builder = builder().bind(relayAddress);
         if (tls) {
             builder.tls(RelayCertificate.fromPem(cert, key));
+        }
+        if (metricsBind != null) {
+            builder.metricsBind(parseAddress(metricsBind));
         }
         RelayServer server = builder.start();
         LOG.info("iroh relay listening on " + server.url());

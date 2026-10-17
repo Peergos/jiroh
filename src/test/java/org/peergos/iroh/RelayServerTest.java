@@ -218,6 +218,72 @@ class RelayServerTest {
         }
     }
 
+    @Test
+    void metricsShouldBeServedAsOpenMetrics() throws Exception {
+        try (RelayServer relay = RelayServer.builder().metricsBind(LOCALHOST).start()) {
+            SecretKey a = SecretKey.generate();
+            SecretKey b = SecretKey.generate();
+            try (RawClient clientA = RawClient.connect(relay.url(), a, V2);
+                 RawClient clientB = RawClient.connect(relay.url(), b, V2)) {
+                clientA.send(datagram(CLIENT_TO_RELAY_DATAGRAM, b.endpointId(), new byte[]{0}, "hello"));
+                clientB.next();
+                clientA.send(datagram(CLIENT_TO_RELAY_DATAGRAM, SecretKey.generate().endpointId(), new byte[]{0}, "nobody"));
+                clientA.send(new byte[]{PING, 1, 2, 3, 4, 5, 6, 7, 8});
+                clientA.next();
+            }
+            HttpResponse<String> response = HttpClient.newHttpClient().send(HttpRequest.newBuilder(
+                    URI.create("http://127.0.0.1:" + relay.metricsAddress().orElseThrow().getPort() + "/metrics")).build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, response.statusCode());
+            String text = response.body();
+            assertTrue(text.contains("relayserver_send_packets_recv_total 2\n"), text);
+            assertTrue(text.contains("relayserver_send_packets_sent_total 1\n"), text);
+            assertTrue(text.contains("relayserver_send_packets_dropped_total 1\n"), text);
+            assertTrue(text.contains("relayserver_bytes_sent_total 5\n"), text);
+            assertTrue(text.contains("relayserver_got_ping_total 1\n"), text);
+            assertTrue(text.contains("relayserver_sent_pong_total 1\n"), text);
+            assertTrue(text.contains("relayserver_unique_client_keys_total 2\n"), text);
+            assertTrue(text.contains("relayserver_bytes_rx_ratelimited_total 0\n"), text);
+            assertTrue(text.endsWith("# EOF\n"), text);
+        }
+    }
+
+    /** The same metric names, help and types as n0's iroh-relay, so its dashboards work. */
+    @Test
+    void metricsShouldMatchIrohRelays() throws Exception {
+        Assumptions.assumeTrue(IrohRelayProcess.available(), "iroh-relay not built");
+        Path dir = Files.createTempDirectory("relay-metrics");
+        int port;
+        int metricsPort;
+        try (java.net.ServerSocket s1 = new java.net.ServerSocket(0); java.net.ServerSocket s2 = new java.net.ServerSocket(0)) {
+            port = s1.getLocalPort();
+            metricsPort = s2.getLocalPort();
+        }
+        Path config = dir.resolve("relay.toml");
+        Files.writeString(config, "http_bind_addr = \"127.0.0.1:" + port + "\"\nenable_metrics = true\nmetrics_bind_addr = \"127.0.0.1:" + metricsPort + "\"\n");
+        Process process = new ProcessBuilder(IrohRelayProcess.BINARY.toString(), "--dev", "-c", config.toString())
+                .redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
+        try {
+            HttpClient client = HttpClient.newHttpClient();
+            String theirs = null;
+            for (int i = 0; i < 100 && theirs == null; i++) {
+                try {
+                    theirs = client.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + metricsPort + "/metrics")).build(),
+                            HttpResponse.BodyHandlers.ofString()).body();
+                }
+                catch (IOException notYet) {
+                    Thread.sleep(50);
+                }
+            }
+            assertNotNull(theirs, "iroh-relay metrics did not come up");
+            assertEquals(theirs.replaceAll("(?m)^(\\S+) \\d+$", "$1 0"), new RelayMetrics().render());
+        }
+        finally {
+            process.destroy();
+            process.waitFor(5, TimeUnit.SECONDS);
+        }
+    }
+
     private static byte[] datagram(int type, EndpointId id, byte[] header, String contents) {
         return concat(new byte[]{(byte) type}, id.toBytes(), header, contents.getBytes(StandardCharsets.UTF_8));
     }

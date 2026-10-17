@@ -17,7 +17,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /** n0's iroh-relay binary in --dev mode (plain HTTP) on a free local port. */
-final class IrohRelayProcess implements AutoCloseable {
+final class IrohRelayProcess implements TestRelay {
 
     static final Path BINARY = Path.of(System.getProperty("iroh.relay.bin", "../iroh/target/release/iroh-relay"));
 
@@ -52,13 +52,7 @@ final class IrohRelayProcess implements AutoCloseable {
         Path dir = Files.createTempDirectory("iroh-relay");
         certificate = dir.resolve("cert.pem");
         Path key = dir.resolve("key.pem");
-        Process openssl = new ProcessBuilder("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-                "-nodes", "-keyout", key.toString(), "-out", certificate.toString(), "-days", "2",
-                "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1")
-                .redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
-        if (openssl.waitFor() != 0) {
-            throw new IOException("openssl failed");
-        }
+        selfSignedCertificate(certificate, key);
         int httpPort = freeTcpPort();
         port = freeTcpPort();
         quicPort = freeUdpPort();
@@ -79,6 +73,25 @@ final class IrohRelayProcess implements AutoCloseable {
         start();
     }
 
+    @Override
+    public URI url() {
+        return url;
+    }
+
+    /**
+     * Writes a self-signed P-256 certificate for 127.0.0.1 and its PKCS#8 key, as PEM. Not a CA, which webpki would
+     * refuse as a server certificate (CaUsedAsEndEntity).
+     */
+    static void selfSignedCertificate(Path certificate, Path key) throws IOException, InterruptedException {
+        Process openssl = new ProcessBuilder("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                "-nodes", "-keyout", key.toString(), "-out", certificate.toString(), "-days", "2",
+                "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1", "-addext", "basicConstraints=critical,CA:FALSE")
+                .redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
+        if (openssl.waitFor() != 0) {
+            throw new IOException("openssl failed");
+        }
+    }
+
     private static int freeTcpPort() throws IOException {
         try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
             return socket.getLocalPort();
@@ -93,6 +106,11 @@ final class IrohRelayProcess implements AutoCloseable {
 
     /** A trust manager that trusts only the relay's self-signed certificate. */
     X509TrustManager trustManager() throws Exception {
+        return trustManager(certificate);
+    }
+
+    /** A trust manager that trusts only the given PEM certificate. */
+    static X509TrustManager trustManager(Path certificate) throws Exception {
         X509Certificate cert;
         try (var in = Files.newInputStream(certificate)) {
             cert = (X509Certificate) CertificateFactory.getInstance("X.509").generateCertificate(in);
@@ -110,7 +128,8 @@ final class IrohRelayProcess implements AutoCloseable {
         restart(0);
     }
 
-    void restart(long downMillis) throws IOException, InterruptedException {
+    @Override
+    public void restart(long downMillis) throws IOException, InterruptedException {
         process.destroy();
         process.waitFor(5, TimeUnit.SECONDS);
         Thread.sleep(downMillis);

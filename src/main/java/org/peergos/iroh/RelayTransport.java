@@ -1,5 +1,7 @@
 package org.peergos.iroh;
 
+import static org.peergos.iroh.RelayProtocol.*;
+
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
@@ -11,11 +13,8 @@ import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.security.InvalidKeyException;
 import java.security.KeyManagementException;
 import java.security.NoSuchAlgorithmException;
-import java.security.Signature;
-import java.security.SignatureException;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Map;
@@ -37,36 +36,13 @@ import java.util.logging.Logger;
  * A client of an iroh relay (iroh-relay protocol v2, falling back to v1), carrying QUIC datagrams to and from
  * other endpoints connected to the same relay. Each remote endpoint is addressed by a relay mapped address.
  *
- * Protocol: iroh-relay/src/protos/{handshake,relay}.rs. Frames are binary WebSocket messages starting with a
- * QUIC varint frame type.
+ * Protocol: {@link RelayProtocol}.
  */
 public final class RelayTransport implements PacketTransport, AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(RelayTransport.class.getName());
 
-    static final String RELAY_PATH = "/relay";
-    static final String[] PROTOCOLS = {"iroh-relay-v2", "iroh-relay-v1"};
-    private static final String DOMAIN_SEP_CHALLENGE = "iroh-relay handshake v1 challenge signature";
-    private static final int MAX_FRAME_SIZE = 1024 * 1024;
     private static final int MAX_PENDING_SENDS = 1024;
-
-    // FrameType, iroh-relay/src/protos/common.rs
-    static final int SERVER_CHALLENGE = 0;
-    static final int CLIENT_AUTH = 1;
-    static final int SERVER_CONFIRMS_AUTH = 2;
-    static final int SERVER_DENIES_AUTH = 3;
-    static final int CLIENT_TO_RELAY_DATAGRAM = 4;
-    static final int CLIENT_TO_RELAY_DATAGRAM_BATCH = 5;
-    static final int RELAY_TO_CLIENT_DATAGRAM = 6;
-    static final int RELAY_TO_CLIENT_DATAGRAM_BATCH = 7;
-    static final int ENDPOINT_GONE = 8;
-    static final int PING = 9;
-    static final int PONG = 10;
-    static final int HEALTH = 11;
-    static final int RESTARTING = 12;
-    static final int STATUS = 13;
-
-    static final Duration PING_INTERVAL = Duration.ofSeconds(15);
     private static final Duration MIN_BACKOFF = Duration.ofMillis(250);
     private static final Duration MAX_BACKOFF = Duration.ofSeconds(30);
     private static final ScheduledExecutorService TIMER = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -405,7 +381,7 @@ public final class RelayTransport implements PacketTransport, AutoCloseable {
                     // postcard ServerChallenge { challenge: [u8; 16] }: the 16 bytes as they are
                     byte[] challenge = new byte[16];
                     frame.get(challenge);
-                    byte[] signature = sign(Blake3.deriveKey(DOMAIN_SEP_CHALLENGE, challenge));
+                    byte[] signature = sign(secretKey, challengeMessage(challenge));
                     // postcard ClientAuth { public_key: [u8; 32], signature: serde_bytes [u8; 64] }
                     ByteBuffer auth = ByteBuffer.allocate(1 + 32 + 1 + 64);
                     auth.put((byte) CLIENT_AUTH).put(secretKey.endpointId().toBytes()).put((byte) 64).put(signature).flip();
@@ -468,47 +444,5 @@ public final class RelayTransport implements PacketTransport, AutoCloseable {
             authenticated.completeExceptionally(error);
             connectionLost(this, MIN_BACKOFF);
         }
-    }
-
-    private byte[] sign(byte[] message) {
-        try {
-            Signature signature = Signature.getInstance("Ed25519");
-            signature.initSign(secretKey.keyPair().getPrivate());
-            signature.update(message);
-            return signature.sign();
-        }
-        catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
-            throw new IllegalStateException(e);
-        }
-    }
-
-    private static EndpointId readEndpointId(ByteBuffer frame) {
-        byte[] id = new byte[32];
-        frame.get(id);
-        return EndpointId.fromBytes(id);
-    }
-
-    /** QUIC variable-length integer (RFC 9000 section 16). */
-    static long readVarint(ByteBuffer buffer) {
-        int first = buffer.get() & 0xff;
-        int length = 1 << (first >> 6);
-        long value = first & 0x3f;
-        for (int i = 1; i < length; i++) {
-            value = (value << 8) | (buffer.get() & 0xff);
-        }
-        return value;
-    }
-
-    /** postcard's LEB128 varint. */
-    private static long readPostcardVarint(ByteBuffer buffer) {
-        long value = 0;
-        for (int shift = 0; shift < 64; shift += 7) {
-            int b = buffer.get() & 0xff;
-            value |= (long) (b & 0x7f) << shift;
-            if ((b & 0x80) == 0) {
-                break;
-            }
-        }
-        return value;
     }
 }

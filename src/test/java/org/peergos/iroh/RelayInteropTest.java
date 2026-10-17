@@ -26,7 +26,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Relay paths through n0's iroh-relay 1.3 (build with: cargo build --release -p iroh-relay --features server
- * --bin iroh-relay in ../iroh), between Java endpoints and against Rust iroh.
+ * --bin iroh-relay in ../iroh), between Java endpoints and against Rust iroh. {@link JavaRelayInteropTest} runs the
+ * same tests through {@link RelayServer}.
  */
 class RelayInteropTest {
 
@@ -34,12 +35,16 @@ class RelayInteropTest {
     private static final Duration TIMEOUT = Duration.ofSeconds(10);
     private static final Path PROBE = Path.of(System.getProperty("interop.probe.dir", "../interop-probe/target/release"));
 
-    private IrohRelayProcess relay;
+    private TestRelay relay;
 
     @BeforeEach
     void startRelay() throws Exception {
+        relay = newRelay();
+    }
+
+    TestRelay newRelay() throws Exception {
         Assumptions.assumeTrue(IrohRelayProcess.available(), "iroh-relay not built");
-        relay = new IrohRelayProcess();
+        return new IrohRelayProcess();
     }
 
     @AfterEach
@@ -112,7 +117,7 @@ class RelayInteropTest {
         Assumptions.assumeTrue(Files.isExecutable(PROBE.resolve("server")), "interop-probe not built");
         SecretKey serverKey = SecretKey.generate();
         Process server = new ProcessBuilder(PROBE.resolve("server").toString(), "127.0.0.1:0",
-                HexFormat.of().formatHex(serverKey.toBytes()), relay.url.toString())
+                HexFormat.of().formatHex(serverKey.toBytes()), relay.url().toString())
                 .redirectErrorStream(true)
                 .start();
         try {
@@ -142,7 +147,7 @@ class RelayInteropTest {
         Assumptions.assumeTrue(Files.isExecutable(PROBE.resolve("server")), "interop-probe not built");
         SecretKey serverKey = SecretKey.generate();
         Process server = new ProcessBuilder(PROBE.resolve("server").toString(), "127.0.0.1:0",
-                HexFormat.of().formatHex(serverKey.toBytes()), relay.url.toString())
+                HexFormat.of().formatHex(serverKey.toBytes()), relay.url().toString())
                 .redirectErrorStream(true)
                 .start();
         try {
@@ -184,7 +189,7 @@ class RelayInteropTest {
         EchoProtocol echo = new EchoProtocol();
         try (Endpoint server = Endpoint.bind(serverKey, LOCALHOST, Map.of(EchoProtocol.ALPN, echo), List.of(transport))) {
             Process client = new ProcessBuilder(PROBE.resolve("iroh_client").toString(), "-", server.id().toHex(), "3",
-                    relay.url.toString())
+                    relay.url().toString())
                     .redirectErrorStream(true)
                     .start();
             boolean exited = client.waitFor(30, TimeUnit.SECONDS);
@@ -209,7 +214,7 @@ class RelayInteropTest {
                 .transport(transport).protocol(EchoProtocol.ALPN, echo).build()) {
             InetSocketAddress direct = server.localAddress();
             ProcessBuilder builder = new ProcessBuilder(PROBE.resolve("iroh_client").toString(),
-                    direct.getAddress().getHostAddress() + ":" + direct.getPort(), server.id().toHex(), "3", relay.url.toString())
+                    direct.getAddress().getHostAddress() + ":" + direct.getPort(), server.id().toHex(), "3", relay.url().toString())
                     .redirectErrorStream(true);
             builder.environment().put("IROH_CLIENT_LINGER_MS", "3000");
             Process client = builder.start();
@@ -238,7 +243,7 @@ class RelayInteropTest {
         Assumptions.assumeTrue(Files.isExecutable(PROBE.resolve("server")), "interop-probe not built");
         SecretKey serverKey = SecretKey.generate();
         Process server = new ProcessBuilder(PROBE.resolve("server").toString(), "127.0.0.1:0",
-                HexFormat.of().formatHex(serverKey.toBytes()), relay.url.toString())
+                HexFormat.of().formatHex(serverKey.toBytes()), relay.url().toString())
                 .redirectErrorStream(true)
                 .start();
         StringBuffer serverOutput = new StringBuffer();
@@ -309,7 +314,7 @@ class RelayInteropTest {
     }
 
     private RelayTransport connect(SecretKey key) throws Exception {
-        return RelayTransport.connect(relay.url, key, TIMEOUT);
+        return RelayTransport.connect(relay.url(), key, TIMEOUT);
     }
 
     private static void waitForLine(BufferedReader out, String prefix) throws Exception {

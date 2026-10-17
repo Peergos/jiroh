@@ -175,7 +175,15 @@ public final class RelayTransport implements PacketTransport, AutoCloseable {
         }
         connection.abort();
         LOG.fine("relay connection to " + relayUrl + " lost, reconnecting in " + delay.toMillis() + "ms");
-        TIMER.schedule(this::reconnect, delay.toMillis(), TimeUnit.MILLISECONDS);
+        scheduleReconnect(delay);
+    }
+
+    /**
+     * Attempts block for up to the connect timeout, so they run on their own thread: the timer is shared by all
+     * transports, and one dialling an unresponsive host must not hold up the others.
+     */
+    private void scheduleReconnect(Duration delay) {
+        TIMER.schedule(() -> Thread.ofVirtual().name("iroh-relay-reconnect").start(this::reconnect), delay.toMillis(), TimeUnit.MILLISECONDS);
     }
 
     private void reconnect() {
@@ -193,7 +201,7 @@ public final class RelayTransport implements PacketTransport, AutoCloseable {
                 backoff = backoff.multipliedBy(2).compareTo(MAX_BACKOFF) > 0? MAX_BACKOFF: backoff.multipliedBy(2);
             }
             LOG.fine("relay reconnect to " + relayUrl + " failed (" + e.getMessage() + "), retrying in " + delay.toMillis() + "ms");
-            TIMER.schedule(this::reconnect, delay.toMillis(), TimeUnit.MILLISECONDS);
+            scheduleReconnect(delay);
             return;
         }
         synchronized (this) {

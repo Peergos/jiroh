@@ -219,6 +219,69 @@ class RelayServerTest {
     }
 
     @Test
+    void quicAddressDiscoveryShouldReportTheEndpointsAddress() throws Exception {
+        Path dir = Files.createTempDirectory("relay-qad");
+        Path cert = dir.resolve("cert.pem");
+        Path key = dir.resolve("key.pem");
+        IrohRelayProcess.selfSignedCertificate(cert, key);
+        RelayCertificate certificate = RelayCertificate.fromPem(cert, key);
+        try (RelayServer relay = RelayServer.builder().tls(certificate).quicAddressDiscovery(LOCALHOST).start();
+             Endpoint endpoint = Endpoint.bind(SecretKey.generate(), LOCALHOST, Map.of())) {
+            InetSocketAddress qad = new InetSocketAddress(InetAddress.getLoopbackAddress(), relay.quicPort().orElseThrow());
+            X509TrustManager trust = IrohRelayProcess.trustManager(cert);
+            assertEquals(endpoint.localAddress(), QuicAddressDiscovery.observe(endpoint, qad, trust, TIMEOUT));
+            assertEquals(1, relay.metrics().qadConnections.sum());
+
+            // A new certificate restarts the QAD server on the same port.
+            Path cert2 = dir.resolve("cert2.pem");
+            Path key2 = dir.resolve("key2.pem");
+            IrohRelayProcess.selfSignedCertificate(cert2, key2);
+            certificate.update(RelayCertificate.readPrivateKey(key2), RelayCertificate.readChain(cert2));
+            assertEquals(qad.getPort(), relay.quicPort().orElseThrow());
+            assertEquals(endpoint.localAddress(), QuicAddressDiscovery.observe(endpoint, qad, IrohRelayProcess.trustManager(cert2), TIMEOUT));
+        }
+    }
+
+    /** Rust iroh probes QAD on port 7842 of its relay's host, so this needs that port free. */
+    @Test
+    void rustIrohShouldDiscoverItsAddressFromJavaQad() throws Exception {
+        Assumptions.assumeTrue(Files.isExecutable(PROBE.resolve("iroh_client")), "interop-probe not built");
+        InetSocketAddress qadAddress = new InetSocketAddress(InetAddress.getLoopbackAddress(), QuicAddressDiscovery.DEFAULT_RELAY_QUIC_PORT);
+        try (java.net.DatagramSocket probe = new java.net.DatagramSocket(qadAddress)) {
+            // free
+        }
+        catch (java.net.SocketException taken) {
+            Assumptions.abort("UDP port 7842 is in use");
+        }
+        Path dir = Files.createTempDirectory("relay-qad");
+        Path cert = dir.resolve("cert.pem");
+        Path key = dir.resolve("key.pem");
+        IrohRelayProcess.selfSignedCertificate(cert, key);
+        try (RelayServer relay = RelayServer.builder().tls(RelayCertificate.fromPem(cert, key)).quicAddressDiscovery(qadAddress).start()) {
+            SecretKey serverKey = SecretKey.generate();
+            RelayTransport transport = RelayTransport.connect(relay.url(), serverKey, TIMEOUT, IrohRelayProcess.trustManager(cert));
+            try (Endpoint endpoint = Endpoint.bind(serverKey, LOCALHOST, Map.of(EchoProtocol.ALPN, new EchoProtocol()), List.of(transport))) {
+                ProcessBuilder builder = new ProcessBuilder(PROBE.resolve("iroh_client").toString(), "-", endpoint.id().toHex(), "1",
+                        relay.url().toString())
+                        .redirectErrorStream(true);
+                builder.environment().put("IROH_RELAY_CA", cert.toString());
+                builder.environment().put("RUST_LOG", "iroh::net_report=debug");
+                Process client = builder.start();
+                boolean exited = client.waitFor(30, TimeUnit.SECONDS);
+                String output = new String(client.getInputStream().readAllBytes()).replaceAll("\u001b\\[[0-9;]*m", "");
+                if (!exited) {
+                    client.destroyForcibly();
+                    fail("rust client did not finish:\n" + output);
+                }
+                assertEquals(0, client.exitValue(), output);
+                assertTrue(output.matches("(?s).*QadProbeReport \\{ relay: RelayUrl\\(\"" + java.util.regex.Pattern.quote(relay.url().toString())
+                        + "\"\\), latency: [^,]+, addr: 127\\.0\\.0\\.1:\\d+ }.*"), output);
+                assertTrue(relay.metrics().qadConnections.sum() >= 1);
+            }
+        }
+    }
+
+    @Test
     void clientsOverTheRateLimitShouldBeSlowedAndTold() throws Exception {
         // 20 kB/s with a 2 kB burst: 20 frames of 1 kB take about a second to get through.
         try (RelayServer limited = RelayServer.builder().clientRateLimit(new RelayServer.RateLimit(20_000, 2_000)).start()) {

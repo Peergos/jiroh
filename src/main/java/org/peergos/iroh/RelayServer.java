@@ -37,6 +37,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -56,7 +57,8 @@ import java.util.logging.Logger;
  * WebSocket on /relay, authenticate with their endpoint key, and send each other datagrams by endpoint id.
  *
  * TLS uses an ordinary X.509 certificate ({@link RelayCertificate}, which can be replaced while running), as iroh
- * clients verify relays against web PKI roots. Without TLS the server speaks plain HTTP, like iroh-relay --dev.
+ * clients verify relays against web PKI roots. Without TLS the server speaks plain HTTP, like iroh-relay --dev. With
+ * TLS it can also run QUIC address discovery.
  */
 public final class RelayServer implements AutoCloseable {
 
@@ -69,6 +71,7 @@ public final class RelayServer implements AutoCloseable {
 
     private final ServerSocket serverSocket;
     private final RelayCertificate certificate;
+    private final QadServer qad;
     private final HttpServer metricsServer;
     private final RelayMetrics metrics;
     private final Predicate<EndpointId> accessControl;
@@ -82,9 +85,10 @@ public final class RelayServer implements AutoCloseable {
     private final AtomicInteger keyMaterialAuthentications = new AtomicInteger();
     private volatile boolean closed;
 
-    private RelayServer(Builder config, ServerSocket serverSocket, HttpServer metricsServer) {
+    private RelayServer(Builder config, ServerSocket serverSocket, QadServer qad, HttpServer metricsServer) {
         this.serverSocket = serverSocket;
         this.certificate = config.certificate;
+        this.qad = qad;
         this.metricsServer = metricsServer;
         this.metrics = config.metrics;
         this.accessControl = config.accessControl;
@@ -115,6 +119,7 @@ public final class RelayServer implements AutoCloseable {
     public static final class Builder {
         private InetSocketAddress bind = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
         private RelayCertificate certificate;
+        private InetSocketAddress quicBind;
         private InetSocketAddress metricsBind;
         private RelayMetrics metrics = new RelayMetrics();
         private Predicate<EndpointId> accessControl = id -> true;
@@ -132,6 +137,12 @@ public final class RelayServer implements AutoCloseable {
         /** Serve HTTPS with this certificate. Without one, plain HTTP. */
         public Builder tls(RelayCertificate certificate) {
             this.certificate = certificate;
+            return this;
+        }
+
+        /** Run QUIC address discovery on this UDP address (iroh's default port is 7842). Needs TLS. */
+        public Builder quicAddressDiscovery(InetSocketAddress quicBind) {
+            this.quicBind = quicBind;
             return this;
         }
 
@@ -169,6 +180,9 @@ public final class RelayServer implements AutoCloseable {
         }
 
         public RelayServer start() throws IOException {
+            if (quicBind != null && certificate == null) {
+                throw new IllegalStateException("QUIC address discovery needs TLS");
+            }
             List<AutoCloseable> opened = new ArrayList<>();
             try {
                 ServerSocket socket;
@@ -186,6 +200,11 @@ public final class RelayServer implements AutoCloseable {
                 opened.add(socket);
                 socket.setReuseAddress(true);
                 socket.bind(bind, 1024);
+                QadServer qad = null;
+                if (quicBind != null) {
+                    qad = new QadServer(quicBind, certificate, metrics);
+                    opened.add(qad);
+                }
                 HttpServer metricsServer = null;
                 if (metricsBind != null) {
                     metricsServer = HttpServer.create(metricsBind, 16);
@@ -202,7 +221,7 @@ public final class RelayServer implements AutoCloseable {
                     HttpServer started = metricsServer;
                     opened.add(() -> started.stop(0));
                 }
-                return new RelayServer(this, socket, metricsServer);
+                return new RelayServer(this, socket, qad, metricsServer);
             }
             catch (IOException | RuntimeException e) {
                 for (AutoCloseable closeable : opened) {
@@ -230,6 +249,11 @@ public final class RelayServer implements AutoCloseable {
             host = "[" + host + "]";
         }
         return URI.create((certificate != null? "https": "http") + "://" + host + ":" + address.getPort() + "/");
+    }
+
+    /** The QUIC address discovery port, when it runs. */
+    public OptionalInt quicPort() {
+        return qad == null? OptionalInt.empty(): OptionalInt.of(qad.port());
     }
 
     /** The metrics listener's address, when there is one. */
@@ -263,6 +287,9 @@ public final class RelayServer implements AutoCloseable {
         }
         catch (IOException e) {
             // ignore
+        }
+        if (qad != null) {
+            qad.close();
         }
         if (metricsServer != null) {
             metricsServer.stop(0);
@@ -834,6 +861,7 @@ public final class RelayServer implements AutoCloseable {
             "usage: RelayServer [options]",
             "  --bind host:port          relay listener (443 with TLS, else 127.0.0.1:3340 plain HTTP)",
             "  --cert chain.pem --key key.pem   a certificate and PKCS#8 key",
+            "  --quic-bind host:port | --no-quic    QUIC address discovery (default :7842 with TLS)",
             "  --metrics-bind host:port  serve OpenMetrics on /metrics",
             "  --client-rx bytes/s[:burst]   per-client receive rate limit (burst defaults to a tenth of a second)",
             "  --accept-limit conns/s[:burst]  rate limit on accepting connections");
@@ -841,7 +869,9 @@ public final class RelayServer implements AutoCloseable {
     /** Runs a relay; see USAGE. Without a certificate it serves plain HTTP, for local testing only. */
     public static void main(String[] args) throws Exception {
         String bind = null;
+        String quicBind = null;
         String metricsBind = null;
+        boolean quic = true;
         Path cert = null;
         Path key = null;
         RateLimit clientRx = null;
@@ -852,6 +882,8 @@ public final class RelayServer implements AutoCloseable {
                     case "--bind" -> bind = args[++i];
                     case "--cert" -> cert = Path.of(args[++i]);
                     case "--key" -> key = Path.of(args[++i]);
+                    case "--quic-bind" -> quicBind = args[++i];
+                    case "--no-quic" -> quic = false;
                     case "--metrics-bind" -> metricsBind = args[++i];
                     case "--client-rx" -> clientRx = rateLimit(args[++i], 0.1);
                     case "--accept-limit" -> acceptLimit = rateLimit(args[++i], 1);
@@ -872,6 +904,10 @@ public final class RelayServer implements AutoCloseable {
         Builder builder = builder().bind(relayAddress).clientRateLimit(clientRx).acceptRateLimit(acceptLimit);
         if (tls) {
             builder.tls(RelayCertificate.fromPem(cert, key));
+            String host = relayAddress.getAddress().getHostAddress();
+            if (quic) {
+                builder.quicAddressDiscovery(parseAddress(quicBind != null? quicBind: host + ":" + QuicAddressDiscovery.DEFAULT_RELAY_QUIC_PORT));
+            }
         }
         if (metricsBind != null) {
             builder.metricsBind(parseAddress(metricsBind));

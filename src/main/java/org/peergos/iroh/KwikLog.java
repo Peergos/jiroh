@@ -14,9 +14,21 @@ final class KwikLog extends BaseLogger {
 
     private static final Logger LOG = Logger.getLogger("tech.kwik");
 
+    private final boolean quietPeerCloses;
+
+    KwikLog() {
+        this(false);
+    }
+
+    /** @param quietPeerCloses  log a peer closing with an error code at FINE, for servers where that is routine */
+    KwikLog(boolean quietPeerCloses) {
+        this.quietPeerCloses = quietPeerCloses;
+    }
+
     @Override
     protected void log(String message) {
-        LOG.log(message.contains("busy wait")? Level.FINE: Level.WARNING, message);
+        boolean routine = message.contains("busy wait") || (quietPeerCloses && message.contains("Peer closed the connection"));
+        LOG.log(routine? Level.FINE: Level.WARNING, message);
     }
 
     @Override

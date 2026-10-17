@@ -11,10 +11,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.security.KeyFactory;
+import java.security.KeyStore;
 import java.security.Principal;
 import java.security.PrivateKey;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
+import java.security.interfaces.ECPrivateKey;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.util.Base64;
 import java.util.List;
@@ -23,7 +25,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * The relay's X.509 certificate and key, which can be replaced while the relay runs (as ACME renewals do). The
- * HTTPS listener picks up a new certificate for the next handshake.
+ * HTTPS listener picks up a new certificate for the next handshake; the QAD server is restarted with it.
  */
 public final class RelayCertificate {
 
@@ -97,6 +99,32 @@ public final class RelayCertificate {
     /** Called after each {@link #update}. */
     public void onChange(Runnable listener) {
         listeners.add(listener);
+    }
+
+    /** The current certificate as a key store, for kwik; empty if there is none yet. */
+    Optional<KeyStore> keyStore(char[] password) throws GeneralSecurityException, IOException {
+        Credentials credentials = current;
+        if (credentials == null) {
+            return Optional.empty();
+        }
+        KeyStore store = KeyStore.getInstance("PKCS12");
+        store.load(null, null);
+        store.setKeyEntry(ALIAS, credentials.key(), password, credentials.chain());
+        return Optional.of(store);
+    }
+
+    static String alias() {
+        return ALIAS;
+    }
+
+    /** The named curve kwik needs for an EC key, or null. */
+    Optional<String> ecCurve() {
+        Credentials credentials = current;
+        if (credentials != null && credentials.key() instanceof ECPrivateKey ec) {
+            int bits = ec.getParams().getCurve().getField().getFieldSize();
+            return Optional.of(bits <= 256? "secp256r1": bits <= 384? "secp384r1": "secp521r1");
+        }
+        return Optional.empty();
     }
 
     synchronized SSLContext sslContext() throws GeneralSecurityException {

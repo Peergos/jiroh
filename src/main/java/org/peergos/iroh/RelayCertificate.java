@@ -1,12 +1,18 @@
 package org.peergos.iroh;
 
+import javax.net.ssl.ExtendedSSLSession;
 import javax.net.ssl.KeyManager;
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SNIServerName;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.SSLSocket;
 import javax.net.ssl.X509ExtendedKeyManager;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
@@ -20,20 +26,28 @@ import java.security.interfaces.ECPrivateKey;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * The relay's X.509 certificate and key, which can be replaced while the relay runs (as ACME renewals do). The
  * HTTPS listener picks up a new certificate for the next handshake; the QAD server is restarted with it.
+ *
+ * It also answers ACME tls-alpn-01 challenges (RFC 8737): a handshake that negotiates ALPN acme-tls/1 gets the
+ * challenge certificate for the requested server name instead.
  */
 public final class RelayCertificate {
 
+    static final String ACME_TLS_ALPN = "acme-tls/1";
     private static final String ALIAS = "relay";
+    private static final String CHALLENGE_PREFIX = "acme-tls-alpn:";
 
     private record Credentials(PrivateKey key, X509Certificate[] chain) {}
 
     private volatile Credentials current;
+    private final Map<String, Credentials> alpnChallenges = new ConcurrentHashMap<>();
     private final List<Runnable> listeners = new CopyOnWriteArrayList<>();
     private volatile SSLContext sslContext;
 
@@ -86,6 +100,24 @@ public final class RelayCertificate {
         throw new GeneralSecurityException("unsupported private key in " + pem);
     }
 
+    public static void writePem(Path certificateChain, X509Certificate[] chain, Path privateKey, PrivateKey key) throws IOException, GeneralSecurityException {
+        StringBuilder certs = new StringBuilder();
+        for (X509Certificate cert : chain) {
+            certs.append(pem("CERTIFICATE", cert.getEncoded()));
+        }
+        Path keyTmp = privateKey.resolveSibling(privateKey.getFileName() + ".tmp");
+        Files.writeString(keyTmp, pem("PRIVATE KEY", key.getEncoded()), StandardCharsets.US_ASCII);
+        Files.move(keyTmp, privateKey, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        Path certTmp = certificateChain.resolveSibling(certificateChain.getFileName() + ".tmp");
+        Files.writeString(certTmp, certs, StandardCharsets.US_ASCII);
+        Files.move(certTmp, certificateChain, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    public static String pem(String type, byte[] der) {
+        return "-----BEGIN " + type + "-----\n" + Base64.getMimeEncoder(64, new byte[]{'\n'}).encodeToString(der)
+                + "\n-----END " + type + "-----\n";
+    }
+
     public void update(PrivateKey key, X509Certificate[] chain) {
         current = new Credentials(key, chain.clone());
         listeners.forEach(Runnable::run);
@@ -99,6 +131,18 @@ public final class RelayCertificate {
     /** Called after each {@link #update}. */
     public void onChange(Runnable listener) {
         listeners.add(listener);
+    }
+
+    void addAlpnChallenge(String domain, PrivateKey key, X509Certificate certificate) {
+        alpnChallenges.put(domain.toLowerCase(), new Credentials(key, new X509Certificate[]{certificate}));
+    }
+
+    void removeAlpnChallenge(String domain) {
+        alpnChallenges.remove(domain.toLowerCase());
+    }
+
+    boolean hasAlpnChallenges() {
+        return !alpnChallenges.isEmpty();
     }
 
     /** The current certificate as a key store, for kwik; empty if there is none yet. */
@@ -140,6 +184,10 @@ public final class RelayCertificate {
 
         @Override
         public String chooseServerAlias(String keyType, Principal[] issuers, Socket socket) {
+            if (socket instanceof SSLSocket ssl && ACME_TLS_ALPN.equals(ssl.getHandshakeApplicationProtocol())) {
+                String name = requestedHostName(ssl.getHandshakeSession());
+                return name != null && alpnChallenges.containsKey(name) && "EC".equals(keyType)? CHALLENGE_PREFIX + name: null;
+            }
             Credentials credentials = current;
             return credentials != null && keyTypeMatches(keyType, credentials.key())? ALIAS: null;
         }
@@ -163,6 +211,12 @@ public final class RelayCertificate {
         }
 
         private Credentials credentials(String alias) {
+            if (alias == null) {
+                return null;
+            }
+            if (alias.startsWith(CHALLENGE_PREFIX)) {
+                return alpnChallenges.get(alias.substring(CHALLENGE_PREFIX.length()));
+            }
             return ALIAS.equals(alias)? current: null;
         }
 
@@ -181,6 +235,17 @@ public final class RelayCertificate {
         public String chooseClientAlias(String[] keyType, Principal[] issuers, Socket socket) {
             return null;
         }
+    }
+
+    private static String requestedHostName(SSLSession session) {
+        if (session instanceof ExtendedSSLSession extended) {
+            for (SNIServerName name : extended.getRequestedServerNames()) {
+                if (name instanceof SNIHostName host) {
+                    return host.getAsciiName().toLowerCase();
+                }
+            }
+        }
+        return null;
     }
 
     private static boolean keyTypeMatches(String keyType, PrivateKey key) {

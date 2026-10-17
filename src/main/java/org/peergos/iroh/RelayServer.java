@@ -3,9 +3,14 @@ package org.peergos.iroh;
 import static org.peergos.iroh.RelayProtocol.*;
 
 import com.sun.net.httpserver.HttpServer;
+import org.peergos.iroh.acme.AcmeCertificates;
+import org.peergos.iroh.acme.AcmeClient;
+import org.peergos.iroh.acme.ChallengeResponder;
 
 import javax.net.ssl.ExtendedSSLSession;
+import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManagerFactory;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.EOFException;
@@ -25,8 +30,11 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
+import java.security.KeyStore;
 import java.security.MessageDigest;
+import java.security.PrivateKey;
 import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -56,9 +64,9 @@ import java.util.logging.Logger;
  * An iroh relay server, wire compatible with n0's iroh-relay 1.3 (iroh-relay/src/server): endpoints connect over a
  * WebSocket on /relay, authenticate with their endpoint key, and send each other datagrams by endpoint id.
  *
- * TLS uses an ordinary X.509 certificate ({@link RelayCertificate}, which can be replaced while running), as iroh
- * clients verify relays against web PKI roots. Without TLS the server speaks plain HTTP, like iroh-relay --dev. With
- * TLS it can also run QUIC address discovery.
+ * TLS uses an ordinary X.509 certificate ({@link RelayCertificate}, which ACME can keep renewed), as iroh clients
+ * verify relays against web PKI roots. Without TLS the server speaks plain HTTP, like iroh-relay --dev. With TLS it
+ * can also run QUIC address discovery, and a plain HTTP listener for captive portal checks and ACME http-01.
  */
 public final class RelayServer implements AutoCloseable {
 
@@ -67,9 +75,11 @@ public final class RelayServer implements AutoCloseable {
     private static final Duration HANDSHAKE_TIMEOUT = Duration.ofSeconds(10);
     private static final Duration PONG_TIMEOUT = Duration.ofSeconds(5);
     private static final int SEND_QUEUE_DEPTH = 512;
+    private static final String ACME_CHALLENGE_PATH = "/.well-known/acme-challenge/";
     private static final Outgoing STOP = new Outgoing(ServerWebSocket.CLOSE, new byte[0]);
 
     private final ServerSocket serverSocket;
+    private final ServerSocket httpSocket;
     private final RelayCertificate certificate;
     private final QadServer qad;
     private final HttpServer metricsServer;
@@ -77,6 +87,7 @@ public final class RelayServer implements AutoCloseable {
     private final Predicate<EndpointId> accessControl;
     private final RateLimit clientRx;
     private final TokenBucket acceptLimit;
+    private final Map<String, String> acmeHttpTokens = new ConcurrentHashMap<>();
     private final SecureRandom random = new SecureRandom();
     private final ScheduledThreadPoolExecutor timer;
     private final Map<EndpointId, Registration> clients = new ConcurrentHashMap<>();
@@ -85,8 +96,9 @@ public final class RelayServer implements AutoCloseable {
     private final AtomicInteger keyMaterialAuthentications = new AtomicInteger();
     private volatile boolean closed;
 
-    private RelayServer(Builder config, ServerSocket serverSocket, QadServer qad, HttpServer metricsServer) {
+    private RelayServer(Builder config, ServerSocket serverSocket, ServerSocket httpSocket, QadServer qad, HttpServer metricsServer) {
         this.serverSocket = serverSocket;
+        this.httpSocket = httpSocket;
         this.certificate = config.certificate;
         this.qad = qad;
         this.metricsServer = metricsServer;
@@ -100,7 +112,10 @@ public final class RelayServer implements AutoCloseable {
             return thread;
         });
         timer.setRemoveOnCancelPolicy(true);
-        Thread.ofPlatform().daemon().name("iroh-relay-server-accept").start(this::acceptLoop);
+        Thread.ofPlatform().daemon().name("iroh-relay-server-accept").start(() -> acceptLoop(serverSocket, true));
+        if (httpSocket != null) {
+            Thread.ofPlatform().daemon().name("iroh-relay-server-accept-http").start(() -> acceptLoop(httpSocket, false));
+        }
     }
 
     /** A token bucket rate: a sustained rate per second, and how much may be used at once. */
@@ -119,6 +134,7 @@ public final class RelayServer implements AutoCloseable {
     public static final class Builder {
         private InetSocketAddress bind = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
         private RelayCertificate certificate;
+        private InetSocketAddress httpBind;
         private InetSocketAddress quicBind;
         private InetSocketAddress metricsBind;
         private RelayMetrics metrics = new RelayMetrics();
@@ -137,6 +153,15 @@ public final class RelayServer implements AutoCloseable {
         /** Serve HTTPS with this certificate. Without one, plain HTTP. */
         public Builder tls(RelayCertificate certificate) {
             this.certificate = certificate;
+            return this;
+        }
+
+        /**
+         * With TLS, also listen for plain HTTP here: captive portal checks (/generate_204) and ACME http-01
+         * challenges, but not the relay itself.
+         */
+        public Builder httpBind(InetSocketAddress httpBind) {
+            this.httpBind = httpBind;
             return this;
         }
 
@@ -180,8 +205,8 @@ public final class RelayServer implements AutoCloseable {
         }
 
         public RelayServer start() throws IOException {
-            if (quicBind != null && certificate == null) {
-                throw new IllegalStateException("QUIC address discovery needs TLS");
+            if ((httpBind != null || quicBind != null) && certificate == null) {
+                throw new IllegalStateException("an HTTP listener or QUIC address discovery needs TLS");
             }
             List<AutoCloseable> opened = new ArrayList<>();
             try {
@@ -200,6 +225,13 @@ public final class RelayServer implements AutoCloseable {
                 opened.add(socket);
                 socket.setReuseAddress(true);
                 socket.bind(bind, 1024);
+                ServerSocket http = null;
+                if (httpBind != null) {
+                    http = new ServerSocket();
+                    opened.add(http);
+                    http.setReuseAddress(true);
+                    http.bind(httpBind, 1024);
+                }
                 QadServer qad = null;
                 if (quicBind != null) {
                     qad = new QadServer(quicBind, certificate, metrics);
@@ -221,7 +253,7 @@ public final class RelayServer implements AutoCloseable {
                     HttpServer started = metricsServer;
                     opened.add(() -> started.stop(0));
                 }
-                return new RelayServer(this, socket, qad, metricsServer);
+                return new RelayServer(this, socket, http, qad, metricsServer);
             }
             catch (IOException | RuntimeException e) {
                 for (AutoCloseable closeable : opened) {
@@ -251,6 +283,11 @@ public final class RelayServer implements AutoCloseable {
         return URI.create((certificate != null? "https": "http") + "://" + host + ":" + address.getPort() + "/");
     }
 
+    /** The plain HTTP listener's address, when there is one. */
+    public Optional<InetSocketAddress> httpAddress() {
+        return Optional.ofNullable(httpSocket).map(s -> (InetSocketAddress) s.getLocalSocketAddress());
+    }
+
     /** The QUIC address discovery port, when it runs. */
     public OptionalInt quicPort() {
         return qad == null? OptionalInt.empty(): OptionalInt.of(qad.port());
@@ -263,6 +300,41 @@ public final class RelayServer implements AutoCloseable {
 
     public RelayMetrics metrics() {
         return metrics;
+    }
+
+    /** Where ACME puts its challenge responses, for the relay to serve. */
+    public ChallengeResponder acmeChallenges() {
+        return new ChallengeResponder() {
+            @Override
+            public boolean supportsHttp01() {
+                return httpSocket != null;
+            }
+
+            @Override
+            public void addHttp01(String token, String keyAuthorization) {
+                acmeHttpTokens.put(token, keyAuthorization);
+            }
+
+            @Override
+            public void removeHttp01(String token) {
+                acmeHttpTokens.remove(token);
+            }
+
+            @Override
+            public boolean supportsTlsAlpn01() {
+                return certificate != null;
+            }
+
+            @Override
+            public void addTlsAlpn01(String domain, PrivateKey key, X509Certificate challengeCertificate) {
+                certificate.addAlpnChallenge(domain, key, challengeCertificate);
+            }
+
+            @Override
+            public void removeTlsAlpn01(String domain) {
+                certificate.removeAlpnChallenge(domain);
+            }
+        };
     }
 
     /** How many distinct endpoints are connected. */
@@ -284,6 +356,9 @@ public final class RelayServer implements AutoCloseable {
         closed = true;
         try {
             serverSocket.close();
+            if (httpSocket != null) {
+                httpSocket.close();
+            }
         }
         catch (IOException e) {
             // ignore
@@ -300,17 +375,17 @@ public final class RelayServer implements AutoCloseable {
         timer.shutdownNow();
     }
 
-    private void acceptLoop() {
+    private void acceptLoop(ServerSocket listener, boolean relay) {
         while (!closed) {
             Socket socket;
             try {
-                if (acceptLimit != null) {
+                if (relay && acceptLimit != null) {
                     long wait = acceptLimit.consume(1);
                     if (wait > 0) {
                         Thread.sleep(Duration.ofNanos(wait));
                     }
                 }
-                socket = serverSocket.accept();
+                socket = listener.accept();
             }
             catch (InterruptedException e) {
                 return;
@@ -326,11 +401,15 @@ public final class RelayServer implements AutoCloseable {
                 closeQuietly(socket);
                 continue;
             }
-            Thread.ofVirtual().name("iroh-relay-conn").start(() -> serve(socket));
+            if (socket instanceof SSLSocket ssl) {
+                ssl.setHandshakeApplicationProtocolSelector((s, offered) ->
+                        certificate.hasAlpnChallenges() && offered.contains(RelayCertificate.ACME_TLS_ALPN)? RelayCertificate.ACME_TLS_ALPN: "");
+            }
+            Thread.ofVirtual().name("iroh-relay-conn").start(() -> serve(socket, relay));
         }
     }
 
-    private void serve(Socket socket) {
+    private void serve(Socket socket, boolean relay) {
         metrics.httpConnections.increment();
         boolean errored = false;
         try (socket) {
@@ -346,8 +425,27 @@ public final class RelayServer implements AutoCloseable {
                 ServerWebSocket.writeResponse(out, 405, "Method Not Allowed", Map.of("Connection", "close"), new byte[0]);
                 return;
             }
-            switch (request.path()) {
-                case RELAY_PATH -> upgrade(socket, in, out, request);
+            String path = request.path();
+            if (path.startsWith(ACME_CHALLENGE_PATH)) {
+                String keyAuthorization = acmeHttpTokens.get(path.substring(ACME_CHALLENGE_PATH.length()));
+                if (keyAuthorization == null) {
+                    ServerWebSocket.writeResponse(out, 404, "Not Found", Map.of("Connection", "close"), new byte[0]);
+                }
+                else {
+                    ServerWebSocket.writeResponse(out, 200, "OK", Map.of("Content-Type", "application/octet-stream", "Connection", "close"),
+                            keyAuthorization.getBytes(StandardCharsets.US_ASCII));
+                }
+                return;
+            }
+            switch (path) {
+                case RELAY_PATH -> {
+                    if (relay) {
+                        upgrade(socket, in, out, request);
+                    }
+                    else {
+                        ServerWebSocket.writeResponse(out, 404, "Not Found", Map.of("Connection", "close"), new byte[0]);
+                    }
+                }
                 case PROBE_PATH -> ServerWebSocket.writeResponse(out, 200, "OK",
                         Map.of("Access-Control-Allow-Origin", "*", "Connection", "close"), new byte[0]);
                 case "/generate_204" -> ServerWebSocket.writeResponse(out, 204, "No Content", Map.of("Connection", "close"), null);
@@ -861,6 +959,13 @@ public final class RelayServer implements AutoCloseable {
             "usage: RelayServer [options]",
             "  --bind host:port          relay listener (443 with TLS, else 127.0.0.1:3340 plain HTTP)",
             "  --cert chain.pem --key key.pem   a certificate and PKCS#8 key",
+            "  --acme-domain name        get certificates from Let's Encrypt for this name (repeatable)",
+            "  --acme-contact email      contact address for the ACME account",
+            "  --acme-dir dir            where certificates and the account key are kept (default ./acme)",
+            "  --acme-staging            use Let's Encrypt's staging CA",
+            "  --acme-url url            use another ACME directory",
+            "  --acme-ca ca.pem          trust this CA for the ACME server",
+            "  --http-bind host:port | --no-http    plain HTTP for captive portal checks and ACME http-01 (default :80 with TLS)",
             "  --quic-bind host:port | --no-quic    QUIC address discovery (default :7842 with TLS)",
             "  --metrics-bind host:port  serve OpenMetrics on /metrics",
             "  --client-rx bytes/s[:burst]   per-client receive rate limit (burst defaults to a tenth of a second)",
@@ -869,11 +974,18 @@ public final class RelayServer implements AutoCloseable {
     /** Runs a relay; see USAGE. Without a certificate it serves plain HTTP, for local testing only. */
     public static void main(String[] args) throws Exception {
         String bind = null;
+        String httpBind = null;
         String quicBind = null;
         String metricsBind = null;
+        boolean http = true;
         boolean quic = true;
         Path cert = null;
         Path key = null;
+        List<String> acmeDomains = new ArrayList<>();
+        String acmeContact = null;
+        Path acmeDir = Path.of("acme");
+        URI acmeUrl = AcmeClient.LETS_ENCRYPT;
+        Path acmeCa = null;
         RateLimit clientRx = null;
         RateLimit acceptLimit = null;
         try {
@@ -882,6 +994,14 @@ public final class RelayServer implements AutoCloseable {
                     case "--bind" -> bind = args[++i];
                     case "--cert" -> cert = Path.of(args[++i]);
                     case "--key" -> key = Path.of(args[++i]);
+                    case "--acme-domain" -> acmeDomains.add(args[++i]);
+                    case "--acme-contact" -> acmeContact = args[++i];
+                    case "--acme-dir" -> acmeDir = Path.of(args[++i]);
+                    case "--acme-staging" -> acmeUrl = AcmeClient.LETS_ENCRYPT_STAGING;
+                    case "--acme-url" -> acmeUrl = URI.create(args[++i]);
+                    case "--acme-ca" -> acmeCa = Path.of(args[++i]);
+                    case "--http-bind" -> httpBind = args[++i];
+                    case "--no-http" -> http = false;
                     case "--quic-bind" -> quicBind = args[++i];
                     case "--no-quic" -> quic = false;
                     case "--metrics-bind" -> metricsBind = args[++i];
@@ -893,18 +1013,26 @@ public final class RelayServer implements AutoCloseable {
             if ((cert == null) != (key == null)) {
                 throw new IllegalArgumentException("--cert and --key go together");
             }
+            if (cert != null && !acmeDomains.isEmpty()) {
+                throw new IllegalArgumentException("use either --cert or --acme-domain");
+            }
         }
         catch (RuntimeException e) {
             System.err.println(e.getMessage() + "\n" + USAGE);
             System.exit(2);
             return;
         }
-        boolean tls = cert != null;
+        boolean tls = cert != null || !acmeDomains.isEmpty();
         InetSocketAddress relayAddress = parseAddress(bind != null? bind: tls? "0.0.0.0:443": "127.0.0.1:3340");
         Builder builder = builder().bind(relayAddress).clientRateLimit(clientRx).acceptRateLimit(acceptLimit);
+        RelayCertificate certificate = null;
         if (tls) {
-            builder.tls(RelayCertificate.fromPem(cert, key));
+            certificate = cert != null? RelayCertificate.fromPem(cert, key): RelayCertificate.empty();
+            builder.tls(certificate);
             String host = relayAddress.getAddress().getHostAddress();
+            if (http) {
+                builder.httpBind(parseAddress(httpBind != null? httpBind: host + ":80"));
+            }
             if (quic) {
                 builder.quicAddressDiscovery(parseAddress(quicBind != null? quicBind: host + ":" + QuicAddressDiscovery.DEFAULT_RELAY_QUIC_PORT));
             }
@@ -914,6 +1042,24 @@ public final class RelayServer implements AutoCloseable {
         }
         RelayServer server = builder.start();
         LOG.info("iroh relay listening on " + server.url());
+        if (!acmeDomains.isEmpty()) {
+            SSLContext acmeTls = null;
+            if (acmeCa != null) {
+                KeyStore trust = KeyStore.getInstance(KeyStore.getDefaultType());
+                trust.load(null, null);
+                int n = 0;
+                for (X509Certificate ca : RelayCertificate.readChain(acmeCa)) {
+                    trust.setCertificateEntry("ca" + n++, ca);
+                }
+                TrustManagerFactory factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+                factory.init(trust);
+                acmeTls = SSLContext.getInstance("TLS");
+                acmeTls.init(null, factory.getTrustManagers(), null);
+            }
+            List<String> contact = acmeContact == null? List.of(): List.of("mailto:" + acmeContact);
+            AcmeCertificates.start(new AcmeCertificates.Config(acmeUrl, acmeDomains, contact, acmeDir,
+                    List.of(AcmeClient.TLS_ALPN_01, AcmeClient.HTTP_01), acmeTls), certificate, server.acmeChallenges());
+        }
         Thread.currentThread().join();
     }
 

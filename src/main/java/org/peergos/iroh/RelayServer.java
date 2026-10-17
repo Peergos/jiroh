@@ -3,8 +3,6 @@ package org.peergos.iroh;
 import static org.peergos.iroh.RelayProtocol.*;
 
 import javax.net.ssl.ExtendedSSLSession;
-import javax.net.ssl.KeyManagerFactory;
-import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocket;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -21,17 +19,10 @@ import java.net.URI;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
-import java.security.KeyFactory;
-import java.security.KeyStore;
 import java.security.MessageDigest;
-import java.security.PrivateKey;
 import java.security.SecureRandom;
-import java.security.cert.Certificate;
-import java.security.cert.CertificateFactory;
-import java.security.spec.PKCS8EncodedKeySpec;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.Arrays;
@@ -56,8 +47,8 @@ import java.util.logging.Logger;
  * An iroh relay server, wire compatible with n0's iroh-relay 1.3 (iroh-relay/src/server): endpoints connect over a
  * WebSocket on /relay, authenticate with their endpoint key, and send each other datagrams by endpoint id.
  *
- * TLS uses an ordinary X.509 certificate, as iroh clients verify relays against web PKI roots. Without TLS the server
- * speaks plain HTTP, like iroh-relay --dev.
+ * TLS uses an ordinary X.509 certificate ({@link RelayCertificate}, which can be replaced while running), as iroh
+ * clients verify relays against web PKI roots. Without TLS the server speaks plain HTTP, like iroh-relay --dev.
  */
 public final class RelayServer implements AutoCloseable {
 
@@ -69,7 +60,7 @@ public final class RelayServer implements AutoCloseable {
     private static final Outgoing STOP = new Outgoing(ServerWebSocket.CLOSE, new byte[0]);
 
     private final ServerSocket serverSocket;
-    private final boolean tls;
+    private final RelayCertificate certificate;
     private final Predicate<EndpointId> accessControl;
     private final SecureRandom random = new SecureRandom();
     private final ScheduledThreadPoolExecutor timer;
@@ -79,10 +70,10 @@ public final class RelayServer implements AutoCloseable {
     private final AtomicInteger keyMaterialAuthentications = new AtomicInteger();
     private volatile boolean closed;
 
-    private RelayServer(ServerSocket serverSocket, boolean tls, Predicate<EndpointId> accessControl) {
+    private RelayServer(Builder config, ServerSocket serverSocket) {
         this.serverSocket = serverSocket;
-        this.tls = tls;
-        this.accessControl = accessControl;
+        this.certificate = config.certificate;
+        this.accessControl = config.accessControl;
         this.timer = new ScheduledThreadPoolExecutor(1, r -> {
             Thread thread = new Thread(r, "iroh-relay-server-timer");
             thread.setDaemon(true);
@@ -98,19 +89,20 @@ public final class RelayServer implements AutoCloseable {
 
     public static final class Builder {
         private InetSocketAddress bind = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
-        private SSLContext sslContext;
+        private RelayCertificate certificate;
         private Predicate<EndpointId> accessControl = id -> true;
 
         private Builder() {}
 
+        /** The relay listener: HTTPS with {@link #tls}, else plain HTTP. */
         public Builder bind(InetSocketAddress bind) {
             this.bind = bind;
             return this;
         }
 
-        /** Serve HTTPS with this context; see {@link #tlsContext}. Without one, plain HTTP. */
-        public Builder tls(SSLContext sslContext) {
-            this.sslContext = sslContext;
+        /** Serve HTTPS with this certificate. Without one, plain HTTP. */
+        public Builder tls(RelayCertificate certificate) {
+            this.certificate = certificate;
             return this;
         }
 
@@ -121,51 +113,22 @@ public final class RelayServer implements AutoCloseable {
         }
 
         public RelayServer start() throws IOException {
-            ServerSocket socket = sslContext == null? new ServerSocket(): sslContext.getServerSocketFactory().createServerSocket();
+            ServerSocket socket;
+            if (certificate == null) {
+                socket = new ServerSocket();
+            }
+            else {
+                try {
+                    socket = certificate.sslContext().getServerSocketFactory().createServerSocket();
+                }
+                catch (GeneralSecurityException e) {
+                    throw new IOException(e);
+                }
+            }
             socket.setReuseAddress(true);
             socket.bind(bind, 1024);
-            return new RelayServer(socket, sslContext != null, accessControl);
+            return new RelayServer(this, socket);
         }
-    }
-
-    /** A TLS context from a PEM certificate chain and a PEM PKCS#8 private key (EC, RSA or Ed25519). */
-    public static SSLContext tlsContext(Path certificateChain, Path privateKey) throws IOException, GeneralSecurityException {
-        Certificate[] chain;
-        try (InputStream in = Files.newInputStream(certificateChain)) {
-            chain = CertificateFactory.getInstance("X.509").generateCertificates(in).toArray(Certificate[]::new);
-        }
-        if (chain.length == 0) {
-            throw new GeneralSecurityException("no certificates in " + certificateChain);
-        }
-        String pem = Files.readString(privateKey);
-        int begin = pem.indexOf("-----BEGIN PRIVATE KEY-----");
-        int end = pem.indexOf("-----END PRIVATE KEY-----");
-        if (begin < 0 || end < 0) {
-            throw new GeneralSecurityException(privateKey + " is not a PKCS#8 private key (convert it with openssl pkcs8 -topk8 -nocrypt)");
-        }
-        byte[] der = Base64.getMimeDecoder().decode(pem.substring(begin + "-----BEGIN PRIVATE KEY-----".length(), end));
-        PrivateKey key = null;
-        for (String algorithm : new String[]{"EC", "RSA", "Ed25519"}) {
-            try {
-                key = KeyFactory.getInstance(algorithm).generatePrivate(new PKCS8EncodedKeySpec(der));
-                break;
-            }
-            catch (GeneralSecurityException wrongAlgorithm) {
-                // try the next
-            }
-        }
-        if (key == null) {
-            throw new GeneralSecurityException("unsupported private key in " + privateKey);
-        }
-        char[] password = new char[0];
-        KeyStore store = KeyStore.getInstance("PKCS12");
-        store.load(null, null);
-        store.setKeyEntry("relay", key, password, chain);
-        KeyManagerFactory keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-        keyManagers.init(store, password);
-        SSLContext context = SSLContext.getInstance("TLS");
-        context.init(keyManagers.getKeyManagers(), null, null);
-        return context;
     }
 
     public InetSocketAddress address() {
@@ -179,7 +142,7 @@ public final class RelayServer implements AutoCloseable {
         if (host.contains(":")) {
             host = "[" + host + "]";
         }
-        return URI.create((tls? "https": "http") + "://" + host + ":" + address.getPort() + "/");
+        return URI.create((certificate != null? "https": "http") + "://" + host + ":" + address.getPort() + "/");
     }
 
     /** How many distinct endpoints are connected. */
@@ -690,40 +653,48 @@ public final class RelayServer implements AutoCloseable {
         }
     }
 
-    /**
-     * Runs a relay: RelayServer [--bind host:port] [--cert chain.pem --key key.pem]. Without a certificate it
-     * serves plain HTTP, for local testing only.
-     */
+    private static final String USAGE = String.join("\n",
+            "usage: RelayServer [options]",
+            "  --bind host:port          relay listener (443 with TLS, else 127.0.0.1:3340 plain HTTP)",
+            "  --cert chain.pem --key key.pem   a certificate and PKCS#8 key");
+
+    /** Runs a relay; see USAGE. Without a certificate it serves plain HTTP, for local testing only. */
     public static void main(String[] args) throws Exception {
         String bind = null;
         Path cert = null;
         Path key = null;
-        for (int i = 0; i < args.length; i++) {
-            switch (args[i]) {
-                case "--bind" -> bind = args[++i];
-                case "--cert" -> cert = Path.of(args[++i]);
-                case "--key" -> key = Path.of(args[++i]);
-                default -> {
-                    System.err.println("usage: RelayServer [--bind host:port] [--cert chain.pem --key key.pem]");
-                    System.exit(2);
+        try {
+            for (int i = 0; i < args.length; i++) {
+                switch (args[i]) {
+                    case "--bind" -> bind = args[++i];
+                    case "--cert" -> cert = Path.of(args[++i]);
+                    case "--key" -> key = Path.of(args[++i]);
+                    default -> throw new IllegalArgumentException("unknown option " + args[i]);
                 }
             }
+            if ((cert == null) != (key == null)) {
+                throw new IllegalArgumentException("--cert and --key go together");
+            }
         }
-        if ((cert == null) != (key == null)) {
-            System.err.println("--cert and --key go together");
+        catch (RuntimeException e) {
+            System.err.println(e.getMessage() + "\n" + USAGE);
             System.exit(2);
+            return;
         }
-        if (bind == null) {
-            bind = cert == null? "127.0.0.1:3340": "0.0.0.0:443";
-        }
-        int colon = bind.lastIndexOf(':');
-        String host = bind.substring(0, colon).replaceAll("^\\[|]$", "");
-        Builder builder = builder().bind(new InetSocketAddress(InetAddress.getByName(host), Integer.parseInt(bind.substring(colon + 1))));
-        if (cert != null) {
-            builder.tls(tlsContext(cert, key));
+        boolean tls = cert != null;
+        InetSocketAddress relayAddress = parseAddress(bind != null? bind: tls? "0.0.0.0:443": "127.0.0.1:3340");
+        Builder builder = builder().bind(relayAddress);
+        if (tls) {
+            builder.tls(RelayCertificate.fromPem(cert, key));
         }
         RelayServer server = builder.start();
         LOG.info("iroh relay listening on " + server.url());
         Thread.currentThread().join();
+    }
+
+    private static InetSocketAddress parseAddress(String hostPort) throws IOException {
+        int colon = hostPort.lastIndexOf(':');
+        String host = hostPort.substring(0, colon).replaceAll("^\\[|]$", "");
+        return new InetSocketAddress(InetAddress.getByName(host.isEmpty()? "0.0.0.0": host), Integer.parseInt(hostPort.substring(colon + 1)));
     }
 }

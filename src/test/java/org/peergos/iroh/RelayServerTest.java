@@ -85,7 +85,7 @@ class RelayServerTest {
         Path key = dir.resolve("key.pem");
         IrohRelayProcess.selfSignedCertificate(cert, key);
         X509TrustManager trust = IrohRelayProcess.trustManager(cert);
-        try (JavaRelay relay = new JavaRelay(RelayServer.tlsContext(cert, key))) {
+        try (JavaRelay relay = new JavaRelay(RelayCertificate.fromPem(cert, key))) {
             assertEquals("https", relay.url().getScheme());
             SecretKey keyA = SecretKey.generate();
             SecretKey keyB = SecretKey.generate();
@@ -108,7 +108,7 @@ class RelayServerTest {
         Path cert = dir.resolve("cert.pem");
         Path key = dir.resolve("key.pem");
         IrohRelayProcess.selfSignedCertificate(cert, key);
-        try (JavaRelay relay = new JavaRelay(RelayServer.tlsContext(cert, key))) {
+        try (JavaRelay relay = new JavaRelay(RelayCertificate.fromPem(cert, key))) {
             SecretKey serverKey = SecretKey.generate();
             RelayTransport transport = RelayTransport.connect(relay.url(), serverKey, TIMEOUT, IrohRelayProcess.trustManager(cert));
             try (Endpoint endpoint = Endpoint.bind(serverKey, LOCALHOST, Map.of(EchoProtocol.ALPN, new EchoProtocol()), List.of(transport))) {

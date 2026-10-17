@@ -1,6 +1,5 @@
 package org.peergos.iroh;
 
-import javax.net.ssl.SSLContext;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -9,14 +8,14 @@ import java.net.URI;
 /** A {@link RelayServer} on a local port. */
 final class JavaRelay implements TestRelay {
 
-    private final SSLContext tls;
+    private final RelayCertificate tls;
     private volatile RelayServer server;
 
     JavaRelay() throws IOException {
         this(null);
     }
 
-    JavaRelay(SSLContext tls) throws IOException {
+    JavaRelay(RelayCertificate tls) throws IOException {
         this.tls = tls;
         this.server = start(0);
     }

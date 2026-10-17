@@ -11,6 +11,7 @@ import java.io.BufferedOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -71,6 +72,8 @@ public final class RelayServer implements AutoCloseable {
     private final HttpServer metricsServer;
     private final RelayMetrics metrics;
     private final Predicate<EndpointId> accessControl;
+    private final RateLimit clientRx;
+    private final TokenBucket acceptLimit;
     private final SecureRandom random = new SecureRandom();
     private final ScheduledThreadPoolExecutor timer;
     private final Map<EndpointId, Registration> clients = new ConcurrentHashMap<>();
@@ -85,6 +88,8 @@ public final class RelayServer implements AutoCloseable {
         this.metricsServer = metricsServer;
         this.metrics = config.metrics;
         this.accessControl = config.accessControl;
+        this.clientRx = config.clientRx;
+        this.acceptLimit = config.acceptLimit == null? null: new TokenBucket(config.acceptLimit.perSecond(), config.acceptLimit.burst());
         this.timer = new ScheduledThreadPoolExecutor(1, r -> {
             Thread thread = new Thread(r, "iroh-relay-server-timer");
             thread.setDaemon(true);
@@ -92,6 +97,15 @@ public final class RelayServer implements AutoCloseable {
         });
         timer.setRemoveOnCancelPolicy(true);
         Thread.ofPlatform().daemon().name("iroh-relay-server-accept").start(this::acceptLoop);
+    }
+
+    /** A token bucket rate: a sustained rate per second, and how much may be used at once. */
+    public record RateLimit(double perSecond, double burst) {
+        public RateLimit {
+            if (perSecond <= 0 || burst <= 0) {
+                throw new IllegalArgumentException("rate limits must be positive");
+            }
+        }
     }
 
     public static Builder builder() {
@@ -104,6 +118,8 @@ public final class RelayServer implements AutoCloseable {
         private InetSocketAddress metricsBind;
         private RelayMetrics metrics = new RelayMetrics();
         private Predicate<EndpointId> accessControl = id -> true;
+        private RateLimit clientRx;
+        private RateLimit acceptLimit;
 
         private Builder() {}
 
@@ -133,6 +149,22 @@ public final class RelayServer implements AutoCloseable {
         /** Which endpoints may connect; others are sent ServerDeniesAuth. */
         public Builder accessControl(Predicate<EndpointId> accessControl) {
             this.accessControl = accessControl;
+            return this;
+        }
+
+        /**
+         * Limits how fast each client connection is read, in bytes of relay frames, as iroh-relay's
+         * limits.client_rx. A client over the limit is slowed down, not disconnected, and told once with
+         * Status RateLimited (v2 clients).
+         */
+        public Builder clientRateLimit(RateLimit clientRx) {
+            this.clientRx = clientRx;
+            return this;
+        }
+
+        /** Limits how fast connections are accepted on the relay listener (iroh-relay's accept_conn_limit). */
+        public Builder acceptRateLimit(RateLimit acceptLimit) {
+            this.acceptLimit = acceptLimit;
             return this;
         }
 
@@ -245,7 +277,16 @@ public final class RelayServer implements AutoCloseable {
         while (!closed) {
             Socket socket;
             try {
+                if (acceptLimit != null) {
+                    long wait = acceptLimit.consume(1);
+                    if (wait > 0) {
+                        Thread.sleep(Duration.ofNanos(wait));
+                    }
+                }
                 socket = serverSocket.accept();
+            }
+            catch (InterruptedException e) {
+                return;
             }
             catch (IOException e) {
                 if (!closed) {
@@ -562,6 +603,8 @@ public final class RelayServer implements AutoCloseable {
         /** Destinations already recorded in sentTo; only the reader touches it. */
         final Set<EndpointId> recorded = new HashSet<>();
         volatile byte[] outstandingPing;
+        final TokenBucket rxLimit = clientRx == null? null: new TokenBucket(clientRx.perSecond(), clientRx.burst());
+        boolean rateLimited;
         Thread writer;
 
         Client(EndpointId id, boolean v2, Socket socket, ServerWebSocket ws) {
@@ -609,6 +652,9 @@ public final class RelayServer implements AutoCloseable {
                 if (message == null) {
                     return false;
                 }
+                if (rxLimit != null) {
+                    limitRate(message.data().length);
+                }
                 switch (message.opcode()) {
                     case ServerWebSocket.BINARY -> handleFrame(message.data());
                     case ServerWebSocket.PING -> offer(new Outgoing(ServerWebSocket.PONG, message.data()));
@@ -620,6 +666,27 @@ public final class RelayServer implements AutoCloseable {
                     }
                     default -> throw new ProtocolException("unexpected websocket message " + message.opcode());
                 }
+            }
+        }
+
+        private void limitRate(int bytes) throws InterruptedIOException {
+            long wait = rxLimit.consume(bytes);
+            if (wait == 0) {
+                return;
+            }
+            metrics.bytesRxRatelimited.add(bytes);
+            if (!rateLimited) {
+                rateLimited = true;
+                metrics.connsRxRatelimited.increment();
+                if (v2) {
+                    offer(new Outgoing(ServerWebSocket.BINARY, new byte[]{STATUS, STATUS_RATE_LIMITED}));
+                }
+            }
+            try {
+                Thread.sleep(Duration.ofNanos(wait));
+            }
+            catch (InterruptedException e) {
+                throw new InterruptedIOException();
             }
         }
 
@@ -767,7 +834,9 @@ public final class RelayServer implements AutoCloseable {
             "usage: RelayServer [options]",
             "  --bind host:port          relay listener (443 with TLS, else 127.0.0.1:3340 plain HTTP)",
             "  --cert chain.pem --key key.pem   a certificate and PKCS#8 key",
-            "  --metrics-bind host:port  serve OpenMetrics on /metrics");
+            "  --metrics-bind host:port  serve OpenMetrics on /metrics",
+            "  --client-rx bytes/s[:burst]   per-client receive rate limit (burst defaults to a tenth of a second)",
+            "  --accept-limit conns/s[:burst]  rate limit on accepting connections");
 
     /** Runs a relay; see USAGE. Without a certificate it serves plain HTTP, for local testing only. */
     public static void main(String[] args) throws Exception {
@@ -775,6 +844,8 @@ public final class RelayServer implements AutoCloseable {
         String metricsBind = null;
         Path cert = null;
         Path key = null;
+        RateLimit clientRx = null;
+        RateLimit acceptLimit = null;
         try {
             for (int i = 0; i < args.length; i++) {
                 switch (args[i]) {
@@ -782,6 +853,8 @@ public final class RelayServer implements AutoCloseable {
                     case "--cert" -> cert = Path.of(args[++i]);
                     case "--key" -> key = Path.of(args[++i]);
                     case "--metrics-bind" -> metricsBind = args[++i];
+                    case "--client-rx" -> clientRx = rateLimit(args[++i], 0.1);
+                    case "--accept-limit" -> acceptLimit = rateLimit(args[++i], 1);
                     default -> throw new IllegalArgumentException("unknown option " + args[i]);
                 }
             }
@@ -796,7 +869,7 @@ public final class RelayServer implements AutoCloseable {
         }
         boolean tls = cert != null;
         InetSocketAddress relayAddress = parseAddress(bind != null? bind: tls? "0.0.0.0:443": "127.0.0.1:3340");
-        Builder builder = builder().bind(relayAddress);
+        Builder builder = builder().bind(relayAddress).clientRateLimit(clientRx).acceptRateLimit(acceptLimit);
         if (tls) {
             builder.tls(RelayCertificate.fromPem(cert, key));
         }
@@ -806,6 +879,13 @@ public final class RelayServer implements AutoCloseable {
         RelayServer server = builder.start();
         LOG.info("iroh relay listening on " + server.url());
         Thread.currentThread().join();
+    }
+
+    private static RateLimit rateLimit(String value, double defaultBurstSeconds) {
+        String[] parts = value.split(":");
+        double rate = Double.parseDouble(parts[0]);
+        double burst = parts.length > 1? Double.parseDouble(parts[1]): Math.max(1, rate * defaultBurstSeconds);
+        return new RateLimit(rate, burst);
     }
 
     private static InetSocketAddress parseAddress(String hostPort) throws IOException {

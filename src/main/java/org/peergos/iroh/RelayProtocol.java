@@ -46,6 +46,7 @@ final class RelayProtocol {
     // Status, iroh-relay/src/protos/relay.rs
     static final int STATUS_HEALTHY = 0;
     static final int STATUS_SAME_ENDPOINT_ID_CONNECTED = 1;
+    static final int STATUS_RATE_LIMITED = 2;
 
     /** The message a client signs to answer a ServerChallenge. */
     static byte[] challengeMessage(byte[] challenge) {

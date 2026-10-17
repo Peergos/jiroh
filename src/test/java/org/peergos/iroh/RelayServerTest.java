@@ -219,6 +219,46 @@ class RelayServerTest {
     }
 
     @Test
+    void clientsOverTheRateLimitShouldBeSlowedAndTold() throws Exception {
+        // 20 kB/s with a 2 kB burst: 20 frames of 1 kB take about a second to get through.
+        try (RelayServer limited = RelayServer.builder().clientRateLimit(new RelayServer.RateLimit(20_000, 2_000)).start()) {
+            SecretKey a = SecretKey.generate();
+            SecretKey b = SecretKey.generate();
+            try (RawClient sender = RawClient.connect(limited.url(), a, V2);
+                 RawClient receiver = RawClient.connect(limited.url(), b, V2)) {
+                String payload = "x".repeat(1000 - 34);
+                long start = System.nanoTime();
+                for (int i = 0; i < 20; i++) {
+                    sender.send(datagram(CLIENT_TO_RELAY_DATAGRAM, b.endpointId(), new byte[]{0}, payload));
+                }
+                for (int i = 0; i < 20; i++) {
+                    assertEquals(RELAY_TO_CLIENT_DATAGRAM, receiver.next()[0]);
+                }
+                long millis = (System.nanoTime() - start) / 1_000_000;
+                assertTrue(millis >= 800, "20 kB at 20 kB/s took " + millis + "ms");
+                assertArrayEquals(new byte[]{STATUS, STATUS_RATE_LIMITED}, sender.next());
+                assertEquals(1, limited.metrics().connsRxRatelimited.sum());
+                assertTrue(limited.metrics().bytesRxRatelimited.sum() > 0);
+            }
+        }
+    }
+
+    @Test
+    void acceptsShouldBeRateLimited() throws Exception {
+        try (RelayServer limited = RelayServer.builder().acceptRateLimit(new RelayServer.RateLimit(10, 1)).start()) {
+            HttpClient client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
+            long start = System.nanoTime();
+            for (int i = 0; i < 6; i++) {
+                // A new connection each time: the server closes after each response.
+                assertEquals(200, client.send(HttpRequest.newBuilder(limited.url().resolve("/ping")).build(),
+                        HttpResponse.BodyHandlers.discarding()).statusCode());
+            }
+            long millis = (System.nanoTime() - start) / 1_000_000;
+            assertTrue(millis >= 400, "6 connections at 10/s took " + millis + "ms");
+        }
+    }
+
+    @Test
     void metricsShouldBeServedAsOpenMetrics() throws Exception {
         try (RelayServer relay = RelayServer.builder().metricsBind(LOCALHOST).start()) {
             SecretKey a = SecretKey.generate();
